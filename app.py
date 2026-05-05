@@ -1,0 +1,447 @@
+import streamlit as st
+import requests
+import smtplib
+import sqlite3
+import time
+import threading
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+import pandas as pd
+
+# ── Page config ──────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Illegear Repair Notifier",
+    page_icon="🔧",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── Custom CSS ────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap');
+
+:root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --border: #1e1e2e;
+    --accent: #ff3c3c;
+    --accent2: #ff8c00;
+    --text: #e8e8f0;
+    --muted: #6b6b80;
+    --green: #00e676;
+    --yellow: #ffd600;
+}
+
+html, body, [class*="css"] {
+    font-family: 'DM Mono', monospace;
+    background-color: var(--bg) !important;
+    color: var(--text) !important;
+}
+
+h1, h2, h3 { font-family: 'Syne', sans-serif !important; }
+
+.stApp { background-color: var(--bg) !important; }
+
+section[data-testid="stSidebar"] {
+    background-color: var(--surface) !important;
+    border-right: 1px solid var(--border) !important;
+}
+
+.stTextInput input, .stTextArea textarea, .stSelectbox select {
+    background-color: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    color: var(--text) !important;
+    font-family: 'DM Mono', monospace !important;
+    border-radius: 4px !important;
+}
+
+.stButton > button {
+    background: var(--accent) !important;
+    color: white !important;
+    border: none !important;
+    font-family: 'Syne', sans-serif !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.05em !important;
+    border-radius: 4px !important;
+    padding: 0.5rem 1.5rem !important;
+    transition: all 0.2s !important;
+}
+.stButton > button:hover { opacity: 0.85 !important; transform: translateY(-1px) !important; }
+
+.metric-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.2rem 1.5rem;
+    margin-bottom: 0.5rem;
+}
+.metric-card .label { color: var(--muted); font-size: 0.75rem; letter-spacing: 0.1em; text-transform: uppercase; }
+.metric-card .value { font-family: 'Syne', sans-serif; font-size: 2rem; font-weight: 800; color: var(--accent); }
+
+.status-badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 3px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+.badge-ready    { background: #00e67620; color: var(--green); border: 1px solid var(--green); }
+.badge-sent     { background: #ff8c0020; color: var(--accent2); border: 1px solid var(--accent2); }
+.badge-pending  { background: #ffd60020; color: var(--yellow); border: 1px solid var(--yellow); }
+.badge-other    { background: #6b6b8020; color: var(--muted); border: 1px solid var(--muted); }
+
+.log-row {
+    background: var(--surface);
+    border-left: 3px solid var(--accent);
+    padding: 0.6rem 1rem;
+    margin-bottom: 0.4rem;
+    border-radius: 0 4px 4px 0;
+    font-size: 0.82rem;
+}
+
+.header-bar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 2rem;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 1rem;
+}
+.bot-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+.bot-on  { background: #00e67615; color: var(--green); border: 1px solid var(--green); }
+.bot-off { background: #ff3c3c15; color: var(--accent); border: 1px solid var(--accent); }
+.pulse { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+div[data-testid="stDataFrame"] { background: var(--surface) !important; border-radius: 8px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Database ──────────────────────────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect("notifier.db", check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS notified (
+            ticket_id TEXT PRIMARY KEY,
+            customer_name TEXT,
+            customer_email TEXT,
+            ticket_number TEXT,
+            notified_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT,
+            level TEXT,
+            message TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+DB = init_db()
+
+def already_notified(ticket_id):
+    row = DB.execute("SELECT 1 FROM notified WHERE ticket_id=?", (ticket_id,)).fetchone()
+    return row is not None
+
+def mark_notified(ticket_id, name, email, ticket_number):
+    DB.execute(
+        "INSERT OR IGNORE INTO notified VALUES (?,?,?,?,?)",
+        (ticket_id, name, email, ticket_number, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    DB.commit()
+
+def add_log(level, message):
+    DB.execute(
+        "INSERT INTO logs (ts, level, message) VALUES (?,?,?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, message)
+    )
+    DB.commit()
+
+def get_logs(limit=50):
+    return DB.execute(
+        "SELECT ts, level, message FROM logs ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+
+def get_notified_list():
+    return DB.execute(
+        "SELECT ticket_number, customer_name, customer_email, notified_at FROM notified ORDER BY notified_at DESC"
+    ).fetchall()
+
+# ── RepairShopr API ───────────────────────────────────────────────────────────
+def fetch_tickets(api_key, subdomain, status_filter):
+    url = f"https://{subdomain}.repairshopr.com/api/v1/tickets"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    params = {"status": status_filter, "per_page": 100}
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("tickets", [])
+    except Exception as e:
+        add_log("ERROR", f"API fetch failed: {e}")
+        return []
+
+# ── Email sender ──────────────────────────────────────────────────────────────
+def send_email(smtp_user, smtp_pass, to_email, customer_name, ticket_number, device, template):
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Your device is ready for pickup! 🔧 Ticket #{ticket_number}"
+    msg["From"]    = f"Illegear Support <{smtp_user}>"
+    msg["To"]      = to_email
+
+    body = template.replace("{name}", customer_name)\
+                    .replace("{ticket}", ticket_number)\
+                    .replace("{device}", device or "your device")
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;background:#0a0a0f;color:#e8e8f0;border-radius:10px;overflow:hidden;">
+      <div style="background:#ff3c3c;padding:28px 32px;">
+        <h1 style="margin:0;font-size:22px;color:white;letter-spacing:0.05em;">ILLEGEAR REPAIR</h1>
+        <p style="margin:4px 0 0;color:#ffaaaa;font-size:13px;">Device Ready Notification</p>
+      </div>
+      <div style="padding:32px;">
+        <p style="font-size:16px;">Hi <strong>{customer_name}</strong>,</p>
+        <p>Great news! Your device is <strong style="color:#00e676;">ready for pickup</strong>.</p>
+        <div style="background:#12121a;border:1px solid #1e1e2e;border-radius:6px;padding:16px;margin:20px 0;">
+          <p style="margin:0 0 6px;color:#6b6b80;font-size:12px;text-transform:uppercase;letter-spacing:0.1em;">Ticket Details</p>
+          <p style="margin:0;font-size:20px;font-weight:bold;color:#ff3c3c;">#{ticket_number}</p>
+          <p style="margin:4px 0 0;color:#aaa;">{device or 'Your device'}</p>
+        </div>
+        <p>Please visit us during operating hours to collect your device. Bring this ticket number as reference.</p>
+        <p style="margin-top:24px;color:#6b6b80;font-size:12px;">— Illegear Support Team<br>support@illegear.com</p>
+      </div>
+    </div>
+    """
+    msg.attach(MIMEText(body, "plain"))
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP("smtp.office365.com", 587) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, to_email, msg.as_string())
+        return True
+    except Exception as e:
+        add_log("ERROR", f"Email to {to_email} failed: {e}")
+        return False
+
+# ── Bot loop (runs in background thread) ─────────────────────────────────────
+_bot_running = False
+_bot_thread  = None
+
+def bot_loop(api_key, subdomain, smtp_user, smtp_pass, status_filter, template):
+    global _bot_running
+    add_log("INFO", "Bot started — checking every 1 second")
+    while _bot_running:
+        tickets = fetch_tickets(api_key, subdomain, status_filter)
+        for t in tickets:
+            tid    = str(t.get("id"))
+            number = t.get("number", tid)
+            name   = t.get("customer", {}).get("fullname", "Customer")
+            email  = t.get("customer", {}).get("email", "")
+            device = t.get("subject", "")
+
+            if not email:
+                continue
+            if already_notified(tid):
+                continue
+
+            success = send_email(smtp_user, smtp_pass, email, name, str(number), device, template)
+            if success:
+                mark_notified(tid, name, email, str(number))
+                add_log("OK", f"Notified {name} ({email}) — Ticket #{number}")
+            else:
+                add_log("ERROR", f"Failed to notify {name} ({email}) — Ticket #{number}")
+
+        time.sleep(1)
+    add_log("INFO", "Bot stopped")
+
+def start_bot(api_key, subdomain, smtp_user, smtp_pass, status_filter, template):
+    global _bot_running, _bot_thread
+    _bot_running = True
+    _bot_thread  = threading.Thread(
+        target=bot_loop,
+        args=(api_key, subdomain, smtp_user, smtp_pass, status_filter, template),
+        daemon=True
+    )
+    _bot_thread.start()
+
+def stop_bot():
+    global _bot_running
+    _bot_running = False
+
+# ── Session state defaults ────────────────────────────────────────────────────
+for k, v in {
+    "bot_on": False,
+    "api_key": "",
+    "smtp_pass": "",
+    "status_filter": "Device is Ready for Collection",
+    "email_template": "Hi {name},\n\nYour device ({device}) is ready for pickup at our store.\nTicket number: #{ticket}\n\nThank you for choosing Illegear!\n\nBest regards,\nIllegear Support Team",
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Configuration")
+    st.markdown("---")
+
+    st.session_state.api_key = st.text_input(
+        "RepairShopr API Key", value=st.session_state.api_key,
+        type="password", placeholder="your-api-key-here"
+    )
+    st.text_input("Subdomain", value="illegearticket", disabled=True)
+    st.text_input("From Email", value="support@illegear.com", disabled=True)
+    st.text_input("SMTP Server", value="smtp.office365.com:587", disabled=True)
+
+    st.session_state.smtp_pass = st.text_input(
+        "Email Password / App Password", value=st.session_state.smtp_pass,
+        type="password", placeholder="••••••••"
+    )
+
+    st.session_state.status_filter = st.selectbox(
+        "Trigger on Ticket Status",
+        ["Device is Ready for Collection", "Ready for Pickup", "Customer Notified", "Waiting for Parts", "Resolved"],
+        index=0
+    )
+
+    st.markdown("---")
+    st.markdown("### 📧 Email Template")
+    st.caption("Use {name}, {ticket}, {device} as placeholders")
+    st.session_state.email_template = st.text_area(
+        "Template", value=st.session_state.email_template, height=180, label_visibility="collapsed"
+    )
+
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("▶ Start", disabled=st.session_state.bot_on):
+            if st.session_state.api_key and st.session_state.smtp_pass:
+                start_bot(
+                    st.session_state.api_key, "illegearticket",
+                    "support@illegear.com", st.session_state.smtp_pass,
+                    st.session_state.status_filter, st.session_state.email_template
+                )
+                st.session_state.bot_on = True
+                st.rerun()
+            else:
+                st.error("Fill in API key & password first.")
+    with col2:
+        if st.button("⏹ Stop", disabled=not st.session_state.bot_on):
+            stop_bot()
+            st.session_state.bot_on = False
+            st.rerun()
+
+# ── Main content ──────────────────────────────────────────────────────────────
+status_html = (
+    '<span class="bot-status bot-on"><span class="pulse"></span>BOT RUNNING</span>'
+    if st.session_state.bot_on else
+    '<span class="bot-status bot-off"><span class="pulse"></span>BOT STOPPED</span>'
+)
+st.markdown(f"""
+<div class="header-bar">
+  <div>
+    <h1 style="margin:0;font-family:Syne,sans-serif;font-size:1.8rem;font-weight:800;letter-spacing:0.04em;">
+      🔧 ILLEGEAR <span style="color:#ff3c3c;">REPAIR NOTIFIER</span>
+    </h1>
+    <p style="margin:2px 0 0;color:#6b6b80;font-size:0.8rem;">Pings customers when their device is ready · illegearticket.repairshopr.com</p>
+  </div>
+  <div style="margin-left:auto">{status_html}</div>
+</div>
+""", unsafe_allow_html=True)
+
+# Metrics row
+notified_list = get_notified_list()
+logs = get_logs(200)
+errors = [l for l in logs if l[1] == "ERROR"]
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.markdown(f'<div class="metric-card"><div class="label">Customers Notified</div><div class="value">{len(notified_list)}</div></div>', unsafe_allow_html=True)
+with c2:
+    st.markdown(f'<div class="metric-card"><div class="label">Log Entries</div><div class="value" style="color:#ff8c00">{len(logs)}</div></div>', unsafe_allow_html=True)
+with c3:
+    st.markdown(f'<div class="metric-card"><div class="label">Errors</div><div class="value" style="color:#{"ff3c3c" if errors else "00e676"}">{len(errors)}</div></div>', unsafe_allow_html=True)
+with c4:
+    st.markdown(f'<div class="metric-card"><div class="label">Check Interval</div><div class="value" style="color:#00e676;font-size:1.4rem">1 sec</div></div>', unsafe_allow_html=True)
+
+st.markdown("---")
+
+tab1, tab2, tab3 = st.tabs(["📋 Live Logs", "✅ Notified Customers", "🔍 Manual Check"])
+
+# ── Tab 1: Logs ───────────────────────────────────────────────────────────────
+with tab1:
+    col_a, col_b = st.columns([3,1])
+    with col_a:
+        st.markdown("#### Activity Log")
+    with col_b:
+        if st.button("🔄 Refresh"):
+            st.rerun()
+
+    logs = get_logs(100)
+    if not logs:
+        st.info("No activity yet. Start the bot to begin.")
+    else:
+        for ts, level, msg in logs:
+            color = {"OK": "#00e676", "ERROR": "#ff3c3c", "INFO": "#ff8c00"}.get(level, "#6b6b80")
+            st.markdown(
+                f'<div class="log-row" style="border-left-color:{color}">'
+                f'<span style="color:#6b6b80">{ts}</span> '
+                f'<span style="color:{color};font-weight:600">[{level}]</span> {msg}'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+# ── Tab 2: Notified customers ─────────────────────────────────────────────────
+with tab2:
+    st.markdown("#### Customers Successfully Notified")
+    if not notified_list:
+        st.info("No customers notified yet.")
+    else:
+        df = pd.DataFrame(notified_list, columns=["Ticket #", "Customer Name", "Email", "Notified At"])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+# ── Tab 3: Manual check ───────────────────────────────────────────────────────
+with tab3:
+    st.markdown("#### Manual Ticket Check")
+    st.caption("Fetch current open tickets from RepairShopr and preview them.")
+    if st.button("🔍 Fetch Tickets Now"):
+        if not st.session_state.api_key:
+            st.error("Enter your API key in the sidebar first.")
+        else:
+            with st.spinner("Fetching from RepairShopr..."):
+                tickets = fetch_tickets(st.session_state.api_key, "illegearticket", st.session_state.status_filter)
+            if tickets:
+                rows = []
+                for t in tickets:
+                    tid    = str(t.get("id"))
+                    number = t.get("number", tid)
+                    name   = t.get("customer", {}).get("fullname", "—")
+                    email  = t.get("customer", {}).get("email", "—")
+                    status = t.get("status", "—")
+                    device = t.get("subject", "—")
+                    sent   = "✅ Yes" if already_notified(tid) else "❌ No"
+                    rows.append([f"#{number}", name, email, device, status, sent])
+                df2 = pd.DataFrame(rows, columns=["Ticket #", "Customer", "Email", "Device", "Status", "Notified?"])
+                st.dataframe(df2, use_container_width=True, hide_index=True)
+                st.success(f"Found {len(tickets)} ticket(s) with status: **{st.session_state.status_filter}**")
+            else:
+                st.warning("No tickets found with that status, or API key is invalid.")
+
+# Auto-refresh while bot is running
+if st.session_state.bot_on:
+    time.sleep(3)
+    st.rerun()
