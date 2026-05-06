@@ -179,28 +179,41 @@ def get_notified_list():
         "FROM notified ORDER BY notified_at DESC"
     ).fetchall()
 
-# ── RepairShopr API ────────────────────────────────────────────────────────────
+# -- RepairShopr API ----------------------------------------------------------------------------
+def safe_get(url, headers, params, retries=3):
+    """GET wrapper that respects Retry-After on 429 responses."""
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", 60))
+                add_log("ERROR", f"Rate limited (429) -- waiting {wait}s as instructed by server")
+                time.sleep(wait + 5)
+                continue
+            return resp
+        except Exception as e:
+            add_log("ERROR", f"Request error (attempt {attempt+1}): {e}")
+            time.sleep(5)
+    return None
+
 def fetch_tickets_by_status(api_key, subdomain, status_filter):
     """Fetch all tickets currently matching a specific status."""
     url     = f"https://{subdomain}.repairshopr.com/api/v1/tickets"
     headers = {"Authorization": f"Bearer {api_key}"}
     tickets, page = [], 1
     while True:
+        resp = safe_get(url, headers, {"status": status_filter, "per_page": 100, "page": page})
+        if resp is None:
+            add_log("ERROR", "API fetch aborted after retries")
+            break
         try:
-            resp = requests.get(url, headers=headers,
-                                params={"status": status_filter, "per_page": 100, "page": page},
-                                timeout=10)
-            if resp.status_code == 429:
-                add_log("ERROR", "Rate limited (429) — waiting 60s")
-                time.sleep(60)
-                continue
             resp.raise_for_status()
             batch = resp.json().get("tickets", [])
             if not batch:
                 break
             tickets.extend(batch)
             page += 1
-            time.sleep(1)  # polite gap between pages
+            time.sleep(2)   # 2s gap between pages = ~30 req/min, well under 180 limit
         except Exception as e:
             add_log("ERROR", f"API fetch failed (page {page}): {e}")
             break
@@ -296,10 +309,8 @@ _bot_thread  = None
 def bot_loop(api_key, subdomain, smtp_user, smtp_pass,
              mode, status_filter, date_from, date_to, template):
     global _bot_running
-    add_log("INFO", f"Bot started · mode={mode} · trigger='{status_filter}' · checking every 1 sec")
-
-    CHECK_INTERVAL = 30   # seconds between each poll (safe for RepairShopr rate limit)
-    RETRY_WAIT     = 60   # seconds to wait after a 429 before retrying
+    CHECK_INTERVAL = 120  # 2 minutes between polls — safe well under 180 req/min limit
+    add_log("INFO", f"Bot started | mode={mode} | trigger='{status_filter}' | check every {CHECK_INTERVAL}s")
 
     while _bot_running:
         try:
@@ -350,11 +361,11 @@ def bot_loop(api_key, subdomain, smtp_user, smtp_pass,
             else:
                 add_log("ERROR", f"Unexpected error: {err}")
 
-        # Sleep in small increments so Stop button responds quickly
-        for _ in range(CHECK_INTERVAL):
-            if not _bot_running:
-                break
-            time.sleep(1)
+        # Sleep in small increments so Stop responds quickly
+        elapsed = 0
+        while elapsed < CHECK_INTERVAL and _bot_running:
+            time.sleep(2)
+            elapsed += 2
 
     add_log("INFO", "Bot stopped")
 
@@ -518,7 +529,7 @@ with c3:
                 f'<div class="value" style="color:#{ec}">{len(errors)}</div></div>', unsafe_allow_html=True)
 with c4:
     st.markdown('<div class="metric-card"><div class="label">Check Interval</div>'
-                '<div class="value" style="color:#00e676;font-size:1.4rem">30 sec</div></div>',
+                f'<div class="value" style="color:#00e676;font-size:1.4rem">2 min</div></div>',
                 unsafe_allow_html=True)
 
 st.markdown("---")
