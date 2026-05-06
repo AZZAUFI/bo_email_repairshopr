@@ -9,13 +9,13 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
 import pandas as pd
 
-  # ── Page config ───────────────────────────────────────────────────────────────
-  st.set_page_config(
-      page_title="Illegear Repair Notifier",
-      page_icon="🔧",
-      layout="wide",
-      initial_sidebar_state="expanded",
-  )
+# ── Page config ───────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Illegear Repair Notifier",
+    page_icon="🔧",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
   # ── Custom CSS ─────────────────────────────────────────────────────────────────
   st.markdown(
