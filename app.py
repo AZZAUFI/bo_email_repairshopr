@@ -190,12 +190,17 @@ def fetch_tickets_by_status(api_key, subdomain, status_filter):
             resp = requests.get(url, headers=headers,
                                 params={"status": status_filter, "per_page": 100, "page": page},
                                 timeout=10)
+            if resp.status_code == 429:
+                add_log("ERROR", "Rate limited (429) — waiting 60s")
+                time.sleep(60)
+                continue
             resp.raise_for_status()
             batch = resp.json().get("tickets", [])
             if not batch:
                 break
             tickets.extend(batch)
             page += 1
+            time.sleep(1)  # polite gap between pages
         except Exception as e:
             add_log("ERROR", f"API fetch failed (page {page}): {e}")
             break
@@ -293,40 +298,63 @@ def bot_loop(api_key, subdomain, smtp_user, smtp_pass,
     global _bot_running
     add_log("INFO", f"Bot started · mode={mode} · trigger='{status_filter}' · checking every 1 sec")
 
+    CHECK_INTERVAL = 30   # seconds between each poll (safe for RepairShopr rate limit)
+    RETRY_WAIT     = 60   # seconds to wait after a 429 before retrying
+
     while _bot_running:
-        if mode == "status":
-            tickets = fetch_tickets_by_status(api_key, subdomain, status_filter)
-        else:
-            # Date range: fetch by date, then verify latest status per ticket
-            raw     = fetch_tickets_by_date(api_key, subdomain, date_from, date_to)
-            tickets = []
-            for t in raw:
-                latest = get_ticket_latest(api_key, subdomain, t["id"])
-                if latest.get("status") == status_filter:
-                    t["status"]     = latest.get("status", "")
-                    t["updated_at"] = latest.get("updated_at", t.get("updated_at", ""))
-                    tickets.append(t)
-
-        for t in tickets:
-            tid        = str(t.get("id"))
-            number     = str(t.get("number", tid))
-            name       = t.get("customer", {}).get("fullname", "Customer")
-            email      = t.get("customer", {}).get("email", "")
-            device     = t.get("subject", "")
-            status     = t.get("status", "")
-            updated_at = (t.get("updated_at") or "")[:19]
-
-            if not email or already_notified(tid):
-                continue
-
-            ok = send_email(smtp_user, smtp_pass, email, name, number, device, template)
-            if ok:
-                mark_notified(tid, name, email, number, device, status, updated_at)
-                add_log("OK", f"Notified {name} ({email}) — Ticket #{number} [{status}]")
+        try:
+            if mode == "status":
+                tickets = fetch_tickets_by_status(api_key, subdomain, status_filter)
             else:
-                add_log("ERROR", f"Failed to notify {name} ({email}) — Ticket #{number}")
+                raw     = fetch_tickets_by_date(api_key, subdomain, date_from, date_to)
+                tickets = []
+                for t in raw:
+                    if not _bot_running:
+                        break
+                    latest = get_ticket_latest(api_key, subdomain, t["id"])
+                    if latest.get("status") == status_filter:
+                        t["status"]     = latest.get("status", "")
+                        t["updated_at"] = latest.get("updated_at", t.get("updated_at", ""))
+                        tickets.append(t)
+                    time.sleep(0.5)   # small gap between per-ticket calls
 
-        time.sleep(1)
+            for t in tickets:
+                if not _bot_running:
+                    break
+                tid        = str(t.get("id"))
+                number     = str(t.get("number", tid))
+                name       = t.get("customer", {}).get("fullname", "Customer")
+                email      = t.get("customer", {}).get("email", "")
+                device     = t.get("subject", "")
+                status     = t.get("status", "")
+                updated_at = (t.get("updated_at") or "")[:19]
+
+                if not email or already_notified(tid):
+                    continue
+
+                ok = send_email(smtp_user, smtp_pass, email, name, number, device, template)
+                if ok:
+                    mark_notified(tid, name, email, number, device, status, updated_at)
+                    add_log("OK", f"Notified {name} ({email}) — Ticket #{number} [{status}]")
+                else:
+                    add_log("ERROR", f"Failed to notify {name} ({email}) — Ticket #{number}")
+
+            add_log("INFO", f"Scan complete — next check in {CHECK_INTERVAL}s")
+
+        except Exception as e:
+            err = str(e)
+            if "429" in err:
+                add_log("ERROR", f"Rate limited by RepairShopr — waiting {RETRY_WAIT}s before retry")
+                time.sleep(RETRY_WAIT)
+                continue
+            else:
+                add_log("ERROR", f"Unexpected error: {err}")
+
+        # Sleep in small increments so Stop button responds quickly
+        for _ in range(CHECK_INTERVAL):
+            if not _bot_running:
+                break
+            time.sleep(1)
 
     add_log("INFO", "Bot stopped")
 
@@ -490,7 +518,7 @@ with c3:
                 f'<div class="value" style="color:#{ec}">{len(errors)}</div></div>', unsafe_allow_html=True)
 with c4:
     st.markdown('<div class="metric-card"><div class="label">Check Interval</div>'
-                '<div class="value" style="color:#00e676;font-size:1.4rem">1 sec</div></div>',
+                '<div class="value" style="color:#00e676;font-size:1.4rem">30 sec</div></div>',
                 unsafe_allow_html=True)
 
 st.markdown("---")
