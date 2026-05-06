@@ -303,6 +303,8 @@ def send_email(smtp_user, smtp_pass, to_email, customer_name, ticket_number, dev
         return False
 
 # ── Bot loop ───────────────────────────────────────────────────────────────────
+# Singleton bot — survives Streamlit reruns via st.session_state
+_bot_lock    = threading.Lock()
 _bot_running = False
 _bot_thread  = None
 
@@ -310,6 +312,9 @@ def bot_loop(api_key, subdomain, smtp_user, smtp_pass,
              mode, status_filter, date_from, date_to, template):
     global _bot_running
     CHECK_INTERVAL = 120  # 2 minutes between polls — safe well under 180 req/min limit
+    # Safety: if somehow called again, bail out immediately
+    with _bot_lock:
+        pass  # just acquiring the lock ensures we are the only thread here
     add_log("INFO", f"Bot started | mode={mode} | trigger='{status_filter}' | check every {CHECK_INTERVAL}s")
 
     while _bot_running:
@@ -372,14 +377,19 @@ def bot_loop(api_key, subdomain, smtp_user, smtp_pass,
 def start_bot(api_key, subdomain, smtp_user, smtp_pass,
               mode, status_filter, date_from, date_to, template):
     global _bot_running, _bot_thread
-    _bot_running = True
-    _bot_thread  = threading.Thread(
-        target=bot_loop,
-        args=(api_key, subdomain, smtp_user, smtp_pass,
-              mode, status_filter, date_from, date_to, template),
-        daemon=True,
-    )
-    _bot_thread.start()
+    with _bot_lock:
+        # If a thread is already alive, do not start another one
+        if _bot_thread is not None and _bot_thread.is_alive():
+            return  # already running — ignore duplicate call
+        _bot_running = True
+        _bot_thread  = threading.Thread(
+            target=bot_loop,
+            args=(api_key, subdomain, smtp_user, smtp_pass,
+                  mode, status_filter, date_from, date_to, template),
+            daemon=True,
+            name="RepairShoprBot",
+        )
+        _bot_thread.start()
 
 def stop_bot():
     global _bot_running
@@ -778,7 +788,7 @@ with tab4:
 | **Email SMTP** | Check password, or try port 465 SSL instead of 587 |
 """)
 
-# ── Auto-refresh ───────────────────────────────────────────────────────────────
+# ── Auto-refresh (safe — only refreshes UI, bot thread is already protected) ──
 if st.session_state.bot_on:
-    time.sleep(3)
+    time.sleep(5)
     st.rerun()
