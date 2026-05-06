@@ -495,7 +495,7 @@ with c4:
 
 st.markdown("---")
 
-tab1, tab2, tab3 = st.tabs(["📋 Live Logs", "✅ Notified Customers", "🔍 Manual Check"])
+tab1, tab2, tab3, tab4 = st.tabs(["📋 Live Logs", "✅ Notified Customers", "🔍 Manual Check", "🧪 Diagnostics"])
 
 # ── Tab 1 ──────────────────────────────────────────────────────────────────────
 with tab1:
@@ -586,6 +586,158 @@ with tab3:
                 st.success(f"Found **{len(tickets)}** ticket(s).")
             else:
                 st.warning("No tickets found with those filters.")
+
+# ── Tab 4: Diagnostics ────────────────────────────────────────────────────────
+with tab4:
+    st.markdown("#### 🧪 Connection Diagnostics")
+    st.caption("Use these tests to pinpoint why emails are not being sent.")
+
+    st.markdown("---")
+
+    # ── Test 1: API connection ──────────────────────────────────────────────
+    st.markdown("##### 1️⃣ Test RepairShopr API Key")
+    if st.button("🔑 Test API Connection"):
+        if not st.session_state.api_key:
+            st.error("Enter your API key in the sidebar first.")
+        else:
+            with st.spinner("Connecting to RepairShopr..."):
+                try:
+                    url  = "https://illegearticket.repairshopr.com/api/v1/tickets"
+                    resp = requests.get(
+                        url,
+                        headers={"Authorization": f"Bearer {st.session_state.api_key}"},
+                        params={"per_page": 5},
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        data    = resp.json()
+                        total   = data.get("meta", {}).get("total_count", "?")
+                        tickets = data.get("tickets", [])
+                        st.success(f"✅ API connected! Total tickets in system: **{total}**")
+                        if tickets:
+                            st.markdown("**Sample tickets returned:**")
+                            rows = [[t.get("number","—"), t.get("subject","—")[:60],
+                                     t.get("status","—"),
+                                     t.get("customer",{}).get("email","—")] for t in tickets]
+                            st.dataframe(
+                                pd.DataFrame(rows, columns=["#", "Subject", "Status", "Email"]),
+                                use_container_width=True, hide_index=True
+                            )
+                        else:
+                            st.warning("API connected but returned 0 tickets. Check if tickets exist.")
+                    elif resp.status_code == 401:
+                        st.error("❌ Invalid API key — 401 Unauthorized. Please check your key.")
+                    else:
+                        st.error(f"❌ API returned status {resp.status_code}: {resp.text[:200]}")
+                except Exception as e:
+                    st.error(f"❌ Could not reach RepairShopr: {e}")
+
+    st.markdown("---")
+
+    # ── Test 2: Status filter ───────────────────────────────────────────────
+    st.markdown("##### 2️⃣ Check Tickets with Exact Status")
+    st.caption(f"Looking for tickets with status = **\"{st.session_state.status_filter}\"**")
+    if st.button("🔍 Check Status Match"):
+        if not st.session_state.api_key:
+            st.error("Enter your API key in the sidebar first.")
+        else:
+            with st.spinner("Fetching tickets by status..."):
+                tickets = fetch_tickets_by_status(
+                    st.session_state.api_key, "illegearticket", st.session_state.status_filter
+                )
+            if tickets:
+                st.success(f"✅ Found **{len(tickets)}** ticket(s) with status \"{st.session_state.status_filter}\"")
+                rows = []
+                for t in tickets:
+                    rows.append([
+                        t.get("number","—"),
+                        t.get("subject","—")[:50],
+                        t.get("status","—"),
+                        t.get("customer",{}).get("email","—"),
+                        "✅ Already sent" if already_notified(str(t.get("id"))) else "❌ Not yet notified"
+                    ])
+                st.dataframe(
+                    pd.DataFrame(rows, columns=["#","Subject","Status","Email","Notified?"]),
+                    use_container_width=True, hide_index=True
+                )
+            else:
+                st.error(f"❌ No tickets found with status \"{st.session_state.status_filter}\"")
+                st.info("💡 Go to RepairShopr → Admin → Ticket Statuses and copy the exact name.")
+
+                # Show all available statuses by fetching a broad sample
+                with st.spinner("Fetching all statuses currently in your tickets..."):
+                    try:
+                        resp = requests.get(
+                            "https://illegearticket.repairshopr.com/api/v1/tickets",
+                            headers={"Authorization": f"Bearer {st.session_state.api_key}"},
+                            params={"per_page": 100},
+                            timeout=10,
+                        )
+                        all_tickets = resp.json().get("tickets", [])
+                        statuses = sorted(set(t.get("status","") for t in all_tickets if t.get("status")))
+                        if statuses:
+                            st.markdown("**Statuses found in your recent tickets:**")
+                            for s in statuses:
+                                match = "✅ MATCH" if s == st.session_state.status_filter else ""
+                                st.code(f"{s}  {match}")
+                    except Exception:
+                        pass
+
+    st.markdown("---")
+
+    # ── Test 3: Email SMTP ──────────────────────────────────────────────────
+    st.markdown("##### 3️⃣ Test Email Sending")
+    test_email = st.text_input("Send test email to", placeholder="youremail@example.com")
+    if st.button("📧 Send Test Email"):
+        if not st.session_state.smtp_pass:
+            st.error("Enter your email password in the sidebar first.")
+        elif not test_email:
+            st.error("Enter a recipient email above.")
+        else:
+            with st.spinner(f"Sending test email to {test_email}..."):
+                try:
+                    msg = MIMEMultipart("alternative")
+                    msg["Subject"] = "✅ Illegear Notifier — SMTP Test"
+                    msg["From"]    = "Illegear Support <support@illegear.com>"
+                    msg["To"]      = test_email
+                    msg.attach(MIMEText(
+                        "This is a test email from your Illegear Repair Notifier bot.\n"
+                        "If you received this, SMTP is working correctly!", "plain"
+                    ))
+                    msg.attach(MIMEText("""
+                        <div style="font-family:Arial,sans-serif;padding:24px;background:#0a0a0f;
+                                    color:#e8e8f0;border-radius:8px;max-width:480px">
+                          <h2 style="color:#ff3c3c;">✅ SMTP Test Successful</h2>
+                          <p>Your Illegear Repair Notifier email system is working correctly.</p>
+                          <p style="color:#6b6b80;font-size:12px;">
+                            Sent from: support@illegear.com via mail.illegear.com</p>
+                        </div>""", "html"
+                    ))
+                    with smtplib.SMTP("mail.illegear.com", 587) as server:
+                        server.starttls()
+                        server.login("support@illegear.com", st.session_state.smtp_pass)
+                        server.sendmail("support@illegear.com", test_email, msg.as_string())
+                    st.success(f"✅ Test email sent to **{test_email}**! Check your inbox.")
+                    add_log("OK", f"SMTP test email sent to {test_email}")
+                except smtplib.SMTPAuthenticationError:
+                    st.error("❌ Authentication failed — wrong email password. Check your credentials.")
+                    add_log("ERROR", "SMTP test failed: authentication error")
+                except smtplib.SMTPConnectError:
+                    st.error("❌ Could not connect to mail.illegear.com:587 — server unreachable.")
+                    add_log("ERROR", "SMTP test failed: connection error")
+                except Exception as e:
+                    st.error(f"❌ Email failed: {e}")
+                    add_log("ERROR", f"SMTP test failed: {e}")
+
+    st.markdown("---")
+    st.markdown("##### 📋 Quick Summary")
+    st.markdown("""
+| Check | What to do if it fails |
+|---|---|
+| **API Key** | Regenerate key in RepairShopr → Admin → API Keys |
+| **Status Match** | Copy exact status name from RepairShopr → Admin → Ticket Statuses |
+| **Email SMTP** | Check password, or try port 465 SSL instead of 587 |
+""")
 
 # ── Auto-refresh ───────────────────────────────────────────────────────────────
 if st.session_state.bot_on:
