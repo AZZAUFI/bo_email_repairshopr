@@ -183,8 +183,15 @@ def run_poll(api_key, smtp_pass, status_filter, template):
     for t in tickets:
         tid    = str(t.get("id"))
         number = str(t.get("number", tid))
-        name   = t.get("customer", {}).get("fullname", "Customer")
-        email  = t.get("customer", {}).get("email", "")
+        cust   = t.get("customer") or {}
+        name   = (cust.get("fullname")
+               or cust.get("name")
+               or f"{cust.get('firstname','')} {cust.get('lastname','')}".strip()
+               or t.get("customer_firstname","")
+               or "Customer").strip() or "Customer"
+        email  = (cust.get("email")
+               or t.get("customer_email")
+               or t.get("contact_email",""))
         device = t.get("subject", "")
         status = t.get("status", "")
         upd    = (t.get("updated_at") or "")[:19]
@@ -374,12 +381,32 @@ with tab3:
             elif data:
                 tickets = data.get("tickets", [])
                 if tickets:
+                    # Show raw keys from first ticket to debug field names
+                    first = tickets[0]
+                    with st.expander("🔬 Raw API fields (first ticket — helps debug missing data)"):
+                        st.json({k: v for k, v in first.items() if k in [
+                            "id","number","status","subject","updated_at",
+                            "customer","customer_id","name","email",
+                            "contact_email","firstname","lastname","fullname",
+                            "customer_firstname","customer_lastname","customer_email",
+                        ]})
+
                     rows = []
                     for t in tickets:
+                        # Try every possible field name RepairShopr might use
+                        cust   = t.get("customer") or {}
+                        name   = (cust.get("fullname")
+                               or cust.get("name")
+                               or f"{cust.get('firstname','')} {cust.get('lastname','')}".strip()
+                               or t.get("customer_firstname","")
+                               or t.get("name","—")).strip() or "—"
+                        email  = (cust.get("email")
+                               or t.get("customer_email")
+                               or t.get("contact_email","—"))
                         rows.append([
                             f"#{t.get('number','')}",
-                            t.get("customer",{}).get("fullname","—"),
-                            t.get("customer",{}).get("email","—"),
+                            name,
+                            email or "—",
                             t.get("subject","—")[:50],
                             t.get("status","—"),
                             (t.get("updated_at") or "")[:10],
