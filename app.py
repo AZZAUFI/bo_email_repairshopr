@@ -1,15 +1,28 @@
+"""
+Illegear Repair Notifier
+========================
+NO background threads — polling is driven by Streamlit's own rerun loop.
+This guarantees exactly ONE API call per cycle, no duplicate threads, no 429 floods.
+"""
+
 import streamlit as st
 import requests
 import smtplib
 import sqlite3
 import time
-import threading
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
 import pandas as pd
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
+SUBDOMAIN      = "illegearticket"
+FROM_EMAIL     = "support@illegear.com"
+SMTP_HOST      = "mail.illegear.com"
+SMTP_PORT      = 587
+POLL_INTERVAL  = 120   # seconds between API polls (2 min — safely under 180 req/min limit)
+
+# ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Illegear Repair Notifier",
     page_icon="🔧",
@@ -17,482 +30,252 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap');
-
 :root {
-    --bg: #0a0a0f;
-    --surface: #12121a;
-    --border: #1e1e2e;
-    --accent: #ff3c3c;
-    --accent2: #ff8c00;
-    --text: #e8e8f0;
-    --muted: #6b6b80;
-    --green: #00e676;
-    --yellow: #ffd600;
+    --bg:#0a0a0f; --surface:#12121a; --border:#1e1e2e;
+    --accent:#ff3c3c; --accent2:#ff8c00;
+    --text:#e8e8f0; --muted:#6b6b80; --green:#00e676; --yellow:#ffd600;
 }
-html, body, [class*="css"] {
-    font-family: 'DM Mono', monospace;
-    background-color: var(--bg) !important;
-    color: var(--text) !important;
-}
-h1, h2, h3 { font-family: 'Syne', sans-serif !important; }
-.stApp { background-color: var(--bg) !important; }
-section[data-testid="stSidebar"] {
-    background-color: var(--surface) !important;
-    border-right: 1px solid var(--border) !important;
-}
-.stTextInput input, .stTextArea textarea, .stSelectbox select,
-.stDateInput input {
-    background-color: var(--surface) !important;
-    border: 1px solid var(--border) !important;
-    color: var(--text) !important;
-    font-family: 'DM Mono', monospace !important;
-    border-radius: 4px !important;
-}
-.stButton > button {
-    background: var(--accent) !important;
-    color: white !important;
-    border: none !important;
-    font-family: 'Syne', sans-serif !important;
-    font-weight: 700 !important;
-    letter-spacing: 0.05em !important;
-    border-radius: 4px !important;
-    padding: 0.5rem 1.5rem !important;
-    transition: all 0.2s !important;
-}
-.stButton > button:hover { opacity: 0.85 !important; transform: translateY(-1px) !important; }
-.metric-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 1.2rem 1.5rem;
-    margin-bottom: 0.5rem;
-}
-.metric-card .label { color: var(--muted); font-size: 0.75rem; letter-spacing: 0.1em; text-transform: uppercase; }
-.metric-card .value { font-family: 'Syne', sans-serif; font-size: 2rem; font-weight: 800; color: var(--accent); }
-.log-row {
-    background: var(--surface);
-    border-left: 3px solid var(--accent);
-    padding: 0.6rem 1rem;
-    margin-bottom: 0.4rem;
-    border-radius: 0 4px 4px 0;
-    font-size: 0.82rem;
-}
-.header-bar {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    margin-bottom: 2rem;
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 1rem;
-}
-.bot-status {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    padding: 4px 12px;
-    border-radius: 20px;
-    font-size: 0.78rem;
-    font-weight: 600;
-}
-.bot-on  { background: #00e67615; color: var(--green); border: 1px solid var(--green); }
-.bot-off { background: #ff3c3c15; color: var(--accent); border: 1px solid var(--accent); }
-.pulse { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: pulse 1.5s infinite; }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
-.filter-pill {
-    display: inline-block;
-    padding: 3px 12px;
-    border-radius: 20px;
-    font-size: 0.75rem;
-    font-weight: 600;
-    background: #ff3c3c20;
-    color: var(--accent);
-    border: 1px solid var(--accent);
-    margin-right: 6px;
-}
-div[data-testid="stDataFrame"] { background: var(--surface) !important; border-radius: 8px; }
+html,body,[class*="css"]{font-family:'DM Mono',monospace;background-color:var(--bg)!important;color:var(--text)!important;}
+h1,h2,h3{font-family:'Syne',sans-serif!important;}
+.stApp{background-color:var(--bg)!important;}
+section[data-testid="stSidebar"]{background-color:var(--surface)!important;border-right:1px solid var(--border)!important;}
+.stTextInput input,.stTextArea textarea,.stDateInput input{
+    background-color:var(--surface)!important;border:1px solid var(--border)!important;
+    color:var(--text)!important;font-family:'DM Mono',monospace!important;border-radius:4px!important;}
+.stButton>button{
+    background:var(--accent)!important;color:white!important;border:none!important;
+    font-family:'Syne',sans-serif!important;font-weight:700!important;
+    letter-spacing:.05em!important;border-radius:4px!important;
+    padding:.5rem 1.5rem!important;transition:all .2s!important;}
+.stButton>button:hover{opacity:.85!important;transform:translateY(-1px)!important;}
+.metric-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem 1.5rem;margin-bottom:.5rem;}
+.metric-card .label{color:var(--muted);font-size:.75rem;letter-spacing:.1em;text-transform:uppercase;}
+.metric-card .value{font-family:'Syne',sans-serif;font-size:2rem;font-weight:800;color:var(--accent);}
+.log-row{background:var(--surface);border-left:3px solid var(--accent);padding:.6rem 1rem;margin-bottom:.4rem;border-radius:0 4px 4px 0;font-size:.82rem;}
+.header-bar{display:flex;align-items:center;gap:1rem;margin-bottom:2rem;border-bottom:1px solid var(--border);padding-bottom:1rem;}
+.bot-status{display:inline-flex;align-items:center;gap:.4rem;padding:4px 12px;border-radius:20px;font-size:.78rem;font-weight:600;}
+.bot-on{background:#00e67615;color:var(--green);border:1px solid var(--green);}
+.bot-off{background:#ff3c3c15;color:var(--accent);border:1px solid var(--accent);}
+.pulse{width:8px;height:8px;border-radius:50%;background:currentColor;animation:pulse 1.5s infinite;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.filter-pill{display:inline-block;padding:3px 12px;border-radius:20px;font-size:.75rem;font-weight:600;background:#ff3c3c20;color:var(--accent);border:1px solid var(--accent);margin-right:6px;}
+.countdown{font-family:'Syne',sans-serif;font-size:1.1rem;color:var(--green);font-weight:700;}
 </style>
 """, unsafe_allow_html=True)
 
 # ── Database ───────────────────────────────────────────────────────────────────
-def init_db():
+@st.cache_resource
+def get_db():
     conn = sqlite3.connect("notifier.db", check_same_thread=False)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS notified (
-            ticket_id      TEXT PRIMARY KEY,
-            customer_name  TEXT,
-            customer_email TEXT,
-            ticket_number  TEXT,
-            device         TEXT,
-            status         TEXT,
-            updated_at     TEXT,
-            notified_at    TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
-            id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts      TEXT,
-            level   TEXT,
-            message TEXT
-        )
-    """)
-    # migrate old schema
+    conn.execute("""CREATE TABLE IF NOT EXISTS notified (
+        ticket_id TEXT PRIMARY KEY, customer_name TEXT, customer_email TEXT,
+        ticket_number TEXT, device TEXT, status TEXT, updated_at TEXT, notified_at TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, level TEXT, message TEXT)""")
     cols = [r[1] for r in conn.execute("PRAGMA table_info(notified)").fetchall()]
-    for col in ["device", "status", "updated_at"]:
+    for col in ["device","status","updated_at"]:
         if col not in cols:
             conn.execute(f"ALTER TABLE notified ADD COLUMN {col} TEXT DEFAULT ''")
     conn.commit()
     return conn
 
-DB = init_db()
+DB = get_db()
 
 def already_notified(ticket_id):
-    return DB.execute("SELECT 1 FROM notified WHERE ticket_id=?", (ticket_id,)).fetchone() is not None
+    return DB.execute("SELECT 1 FROM notified WHERE ticket_id=?", (str(ticket_id),)).fetchone() is not None
 
-def mark_notified(ticket_id, name, email, ticket_number, device, status, updated_at):
-    DB.execute(
-        "INSERT OR IGNORE INTO notified VALUES (?,?,?,?,?,?,?,?)",
-        (ticket_id, name, email, ticket_number, device, status, updated_at,
-         datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    )
+def mark_notified(ticket_id, name, email, number, device, status, updated_at):
+    DB.execute("INSERT OR IGNORE INTO notified VALUES (?,?,?,?,?,?,?,?)",
+        (str(ticket_id), name, email, str(number), device, status, updated_at,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     DB.commit()
 
 def add_log(level, message):
-    DB.execute(
-        "INSERT INTO logs (ts, level, message) VALUES (?,?,?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, message)
-    )
+    DB.execute("INSERT INTO logs (ts,level,message) VALUES (?,?,?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, message))
     DB.commit()
 
 def get_logs(limit=100):
-    return DB.execute(
-        "SELECT ts, level, message FROM logs ORDER BY id DESC LIMIT ?", (limit,)
-    ).fetchall()
+    return DB.execute("SELECT ts,level,message FROM logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
 def get_notified_list():
     return DB.execute(
-        "SELECT ticket_number, customer_name, customer_email, device, status, updated_at, notified_at "
-        "FROM notified ORDER BY notified_at DESC"
-    ).fetchall()
+        "SELECT ticket_number,customer_name,customer_email,device,status,updated_at,notified_at "
+        "FROM notified ORDER BY notified_at DESC").fetchall()
 
-# -- RepairShopr API ----------------------------------------------------------------------------
-def safe_get(url, headers, params, retries=3):
-    """GET wrapper that respects Retry-After on 429 responses."""
-    for attempt in range(retries):
-        try:
-            resp = requests.get(url, headers=headers, params=params, timeout=15)
-            if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", 60))
-                add_log("ERROR", f"Rate limited (429) -- waiting {wait}s as instructed by server")
-                time.sleep(wait + 5)
-                continue
-            return resp
-        except Exception as e:
-            add_log("ERROR", f"Request error (attempt {attempt+1}): {e}")
-            time.sleep(5)
-    return None
-
-def fetch_tickets_by_status(api_key, subdomain, status_filter):
-    """Fetch all tickets currently matching a specific status."""
-    url     = f"https://{subdomain}.repairshopr.com/api/v1/tickets"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    tickets, page = [], 1
-    while True:
-        resp = safe_get(url, headers, {"status": status_filter, "per_page": 100, "page": page})
-        if resp is None:
-            add_log("ERROR", "API fetch aborted after retries")
-            break
-        try:
-            resp.raise_for_status()
-            batch = resp.json().get("tickets", [])
-            if not batch:
-                break
-            tickets.extend(batch)
-            page += 1
-            time.sleep(2)   # 2s gap between pages = ~30 req/min, well under 180 limit
-        except Exception as e:
-            add_log("ERROR", f"API fetch failed (page {page}): {e}")
-            break
-    return tickets
-
-def fetch_tickets_by_date(api_key, subdomain, date_from, date_to):
-    """Fetch all tickets updated within the given date range."""
-    url     = f"https://{subdomain}.repairshopr.com/api/v1/tickets"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    tickets, page = [], 1
-    since = date_from.strftime("%Y-%m-%dT00:00:00Z")
-    while True:
-        try:
-            resp = requests.get(url, headers=headers,
-                                params={"since_updated_at": since, "per_page": 100, "page": page},
-                                timeout=10)
-            resp.raise_for_status()
-            batch = resp.json().get("tickets", [])
-            if not batch:
-                break
-            for t in batch:
-                raw = t.get("updated_at") or t.get("created_at") or ""
-                try:
-                    ts = datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
-                    if ts <= date_to:
-                        tickets.append(t)
-                except Exception:
-                    tickets.append(t)
-            page += 1
-        except Exception as e:
-            add_log("ERROR", f"API date-fetch failed (page {page}): {e}")
-            break
-    return tickets
-
-def get_ticket_latest(api_key, subdomain, ticket_id):
-    """Re-fetch a single ticket to get its absolute latest status."""
-    url     = f"https://{subdomain}.repairshopr.com/api/v1/tickets/{ticket_id}"
+# ── API ────────────────────────────────────────────────────────────────────────
+def api_get(api_key, path, params=None):
+    """Single safe API call. Returns (data_dict | None, error_str | None)."""
+    url     = f"https://{SUBDOMAIN}.repairshopr.com/api/v1/{path}"
     headers = {"Authorization": f"Bearer {api_key}"}
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, params=params or {}, timeout=15)
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", 60))
+            return None, f"429 rate limited — retry after {wait}s"
         resp.raise_for_status()
-        return resp.json().get("ticket", {})
-    except Exception:
-        return {}
+        return resp.json(), None
+    except Exception as e:
+        return None, str(e)
 
-# ── Email sender ───────────────────────────────────────────────────────────────
-def send_email(smtp_user, smtp_pass, to_email, customer_name, ticket_number, device, template):
+def fetch_ready_tickets(api_key, status_filter):
+    """Fetch page 1 only — enough to catch newly ready tickets each cycle."""
+    data, err = api_get(api_key, "tickets", {"status": status_filter, "per_page": 100, "page": 1})
+    if err:
+        return [], err
+    return data.get("tickets", []), None
+
+# ── Email ──────────────────────────────────────────────────────────────────────
+def send_email(smtp_pass, to_email, customer_name, ticket_number, device, template):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Your device is ready for collection! Ticket #{ticket_number}"
-    msg["From"]    = f"Illegear Support <{smtp_user}>"
+    msg["From"]    = f"Illegear Support <{FROM_EMAIL}>"
     msg["To"]      = to_email
-
     body = (template.replace("{name}", customer_name)
-                    .replace("{ticket}", ticket_number)
+                    .replace("{ticket}", str(ticket_number))
                     .replace("{device}", device or "your device"))
-
     html = f"""
     <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;
                 background:#0a0a0f;color:#e8e8f0;border-radius:10px;overflow:hidden;">
       <div style="background:#ff3c3c;padding:28px 32px;">
-        <h1 style="margin:0;font-size:22px;color:white;letter-spacing:0.05em;">ILLEGEAR REPAIR</h1>
+        <h1 style="margin:0;font-size:22px;color:white;">ILLEGEAR REPAIR</h1>
         <p style="margin:4px 0 0;color:#ffaaaa;font-size:13px;">Device Ready for Collection</p>
       </div>
       <div style="padding:32px;">
-        <p style="font-size:16px;">Hi <strong>{customer_name}</strong>,</p>
-        <p>Great news! Your device is <strong style="color:#00e676;">ready for collection</strong>.</p>
+        <p>Hi <strong>{customer_name}</strong>,</p>
+        <p>Your device is <strong style="color:#00e676;">ready for collection</strong>.</p>
         <div style="background:#12121a;border:1px solid #1e1e2e;border-radius:6px;padding:16px;margin:20px 0;">
-          <p style="margin:0 0 6px;color:#6b6b80;font-size:12px;text-transform:uppercase;letter-spacing:0.1em;">Ticket Details</p>
+          <p style="margin:0 0 4px;color:#6b6b80;font-size:11px;text-transform:uppercase;">Ticket</p>
           <p style="margin:0;font-size:20px;font-weight:bold;color:#ff3c3c;">#{ticket_number}</p>
           <p style="margin:4px 0 0;color:#aaa;">{device or 'Your device'}</p>
         </div>
-        <p>Please visit us during operating hours to collect your device. Bring this ticket number as reference.</p>
-        <p style="margin-top:24px;color:#6b6b80;font-size:12px;">— Illegear Support Team<br>support@illegear.com</p>
+        <p>Please bring this ticket number when collecting your device.</p>
+        <p style="color:#6b6b80;font-size:12px;">— Illegear Support<br>{FROM_EMAIL}</p>
       </div>
     </div>"""
-
     msg.attach(MIMEText(body, "plain"))
     msg.attach(MIMEText(html, "html"))
     try:
-        with smtplib.SMTP("mail.illegear.com", 587) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, to_email, msg.as_string())
-        return True
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.starttls()
+            s.login(FROM_EMAIL, smtp_pass)
+            s.sendmail(FROM_EMAIL, to_email, msg.as_string())
+        return True, None
     except Exception as e:
-        add_log("ERROR", f"Email to {to_email} failed: {e}")
-        return False
+        return False, str(e)
 
-# ── Bot loop ───────────────────────────────────────────────────────────────────
-# Singleton bot — survives Streamlit reruns via st.session_state
-_bot_lock    = threading.Lock()
-_bot_running = False
-_bot_thread  = None
+# ── Core poll function (called once per cycle, NO threads) ─────────────────────
+def run_poll(api_key, smtp_pass, status_filter, template):
+    """
+    Called directly from the Streamlit main thread.
+    One function, one API call, fully synchronous — zero thread issues.
+    """
+    tickets, err = fetch_ready_tickets(api_key, status_filter)
 
-def bot_loop(api_key, subdomain, smtp_user, smtp_pass,
-             mode, status_filter, date_from, date_to, template):
-    global _bot_running
-    CHECK_INTERVAL = 120  # 2 minutes between polls — safe well under 180 req/min limit
-    # Safety: if somehow called again, bail out immediately
-    with _bot_lock:
-        pass  # just acquiring the lock ensures we are the only thread here
-    add_log("INFO", f"Bot started | mode={mode} | trigger='{status_filter}' | check every {CHECK_INTERVAL}s")
+    if err:
+        add_log("ERROR", f"API error: {err}")
+        return
 
-    while _bot_running:
-        try:
-            if mode == "status":
-                tickets = fetch_tickets_by_status(api_key, subdomain, status_filter)
-            else:
-                raw     = fetch_tickets_by_date(api_key, subdomain, date_from, date_to)
-                tickets = []
-                for t in raw:
-                    if not _bot_running:
-                        break
-                    latest = get_ticket_latest(api_key, subdomain, t["id"])
-                    if latest.get("status") == status_filter:
-                        t["status"]     = latest.get("status", "")
-                        t["updated_at"] = latest.get("updated_at", t.get("updated_at", ""))
-                        tickets.append(t)
-                    time.sleep(0.5)   # small gap between per-ticket calls
+    new_count = 0
+    for t in tickets:
+        tid    = str(t.get("id"))
+        number = str(t.get("number", tid))
+        name   = t.get("customer", {}).get("fullname", "Customer")
+        email  = t.get("customer", {}).get("email", "")
+        device = t.get("subject", "")
+        status = t.get("status", "")
+        upd    = (t.get("updated_at") or "")[:19]
 
-            for t in tickets:
-                if not _bot_running:
-                    break
-                tid        = str(t.get("id"))
-                number     = str(t.get("number", tid))
-                name       = t.get("customer", {}).get("fullname", "Customer")
-                email      = t.get("customer", {}).get("email", "")
-                device     = t.get("subject", "")
-                status     = t.get("status", "")
-                updated_at = (t.get("updated_at") or "")[:19]
+        if not email or already_notified(tid):
+            continue
 
-                if not email or already_notified(tid):
-                    continue
+        ok, err2 = send_email(smtp_pass, email, name, number, device, template)
+        if ok:
+            mark_notified(tid, name, email, number, device, status, upd)
+            add_log("OK", f"Notified {name} ({email}) — Ticket #{number}")
+            new_count += 1
+        else:
+            add_log("ERROR", f"Email failed for {name} ({email}): {err2}")
 
-                ok = send_email(smtp_user, smtp_pass, email, name, number, device, template)
-                if ok:
-                    mark_notified(tid, name, email, number, device, status, updated_at)
-                    add_log("OK", f"Notified {name} ({email}) — Ticket #{number} [{status}]")
-                else:
-                    add_log("ERROR", f"Failed to notify {name} ({email}) — Ticket #{number}")
-
-            add_log("INFO", f"Scan complete — next check in {CHECK_INTERVAL}s")
-
-        except Exception as e:
-            err = str(e)
-            if "429" in err:
-                add_log("ERROR", f"Rate limited by RepairShopr — waiting {RETRY_WAIT}s before retry")
-                time.sleep(RETRY_WAIT)
-                continue
-            else:
-                add_log("ERROR", f"Unexpected error: {err}")
-
-        # Sleep in small increments so Stop responds quickly
-        elapsed = 0
-        while elapsed < CHECK_INTERVAL and _bot_running:
-            time.sleep(2)
-            elapsed += 2
-
-    add_log("INFO", "Bot stopped")
-
-def start_bot(api_key, subdomain, smtp_user, smtp_pass,
-              mode, status_filter, date_from, date_to, template):
-    global _bot_running, _bot_thread
-    with _bot_lock:
-        # If a thread is already alive, do not start another one
-        if _bot_thread is not None and _bot_thread.is_alive():
-            return  # already running — ignore duplicate call
-        _bot_running = True
-        _bot_thread  = threading.Thread(
-            target=bot_loop,
-            args=(api_key, subdomain, smtp_user, smtp_pass,
-                  mode, status_filter, date_from, date_to, template),
-            daemon=True,
-            name="RepairShoprBot",
-        )
-        _bot_thread.start()
-
-def stop_bot():
-    global _bot_running
-    _bot_running = False
+    msg = f"Scan done — {len(tickets)} ticket(s) matched, {new_count} new notification(s)"
+    add_log("INFO", msg)
 
 # ── Session state ──────────────────────────────────────────────────────────────
-defaults = {
-    "bot_on":        False,
-    "api_key":       "",
-    "smtp_pass":     "",
-    "status_filter": "Device is Ready for Collection",
-    "filter_mode":   "Latest Status (Live)",
-    "date_from":     date.today() - timedelta(days=7),
-    "date_to":       date.today(),
-    "email_template": (
-        "Hi {name},\n\n"
-        "Your device ({device}) is ready for collection at our store.\n"
-        "Ticket number: #{ticket}\n\n"
-        "Thank you for choosing Illegear!\n\n"
-        "Best regards,\nIllegear Support Team"
-    ),
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+def ss(key, default):
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+ss("bot_on",        False)
+ss("api_key",       "")
+ss("smtp_pass",     "")
+ss("status_filter", "Device is Ready for Collection")
+ss("filter_mode",   "Latest Status (Live)")
+ss("date_from",     date.today() - timedelta(days=7))
+ss("date_to",       date.today())
+ss("last_poll",     0.0)   # unix timestamp of last poll
+ss("email_template",
+    "Hi {name},\n\nYour device ({device}) is ready for collection.\n"
+    "Ticket: #{ticket}\n\nThank you!\nIllegear Support Team")
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
     st.markdown("---")
-
-    st.session_state.api_key = st.text_input(
-        "RepairShopr API Key", value=st.session_state.api_key,
-        type="password", placeholder="your-api-key-here"
-    )
-    st.text_input("Subdomain",   value="illegearticket",         disabled=True)
-    st.text_input("From Email",  value="support@illegear.com",   disabled=True)
-    st.text_input("SMTP Server", value="mail.illegear.com:587", disabled=True)
-
-    st.session_state.smtp_pass = st.text_input(
-        "Email Password / App Password", value=st.session_state.smtp_pass,
-        type="password", placeholder="••••••••"
-    )
+    st.session_state.api_key   = st.text_input("RepairShopr API Key",        value=st.session_state.api_key,   type="password", placeholder="your-api-key")
+    st.text_input("Subdomain",   value=SUBDOMAIN,   disabled=True)
+    st.text_input("From Email",  value=FROM_EMAIL,  disabled=True)
+    st.text_input("SMTP Server", value=f"{SMTP_HOST}:{SMTP_PORT}", disabled=True)
+    st.session_state.smtp_pass = st.text_input("Email Password", value=st.session_state.smtp_pass, type="password", placeholder="••••••••")
 
     st.markdown("---")
     st.markdown("### 🎯 Trigger Status")
-    st.session_state.status_filter = st.selectbox(
-        "Notify when ticket status is",
-        ["Device is Ready for Collection", "Ready for Pickup",
-         "Customer Notified", "Waiting for Parts", "Resolved"],
-        index=0,
-    )
-
-    st.markdown("---")
-    st.markdown("### 📅 Detection Mode")
-    st.session_state.filter_mode = st.radio(
-        "How to detect tickets",
-        ["Latest Status (Live)", "Date Range"],
-        index=0,
-        help=(
-            "**Latest Status (Live):** Watches for tickets whose current status "
-            "matches the trigger — checks every second in real time.\n\n"
-            "**Date Range:** Scans tickets updated within a date window and "
-            "verifies their latest status before sending."
-        ),
-    )
-
-    if st.session_state.filter_mode == "Date Range":
-        st.session_state.date_from = st.date_input("From date", value=st.session_state.date_from)
-        st.session_state.date_to   = st.date_input("To date",   value=st.session_state.date_to,
-                                                    min_value=st.session_state.date_from)
-        st.caption(f"Tickets updated: **{st.session_state.date_from}** → **{st.session_state.date_to}**")
+    st.session_state.status_filter = st.selectbox("Notify when status is", [
+        "Device is Ready for Collection", "Ready for Pickup",
+        "Customer Notified", "Waiting for Parts", "Resolved"], index=0)
 
     st.markdown("---")
     st.markdown("### 📧 Email Template")
     st.caption("Placeholders: `{name}` · `{ticket}` · `{device}`")
     st.session_state.email_template = st.text_area(
-        "Template", value=st.session_state.email_template,
-        height=160, label_visibility="collapsed"
-    )
+        "Template", value=st.session_state.email_template, height=140, label_visibility="collapsed")
 
     st.markdown("---")
     c1, c2 = st.columns(2)
     with c1:
         if st.button("▶ Start", disabled=st.session_state.bot_on):
-            if st.session_state.api_key and st.session_state.smtp_pass:
-                mode = "status" if st.session_state.filter_mode == "Latest Status (Live)" else "date"
-                start_bot(
-                    st.session_state.api_key, "illegearticket",
-                    "support@illegear.com", st.session_state.smtp_pass,
-                    mode, st.session_state.status_filter,
-                    st.session_state.date_from, st.session_state.date_to,
-                    st.session_state.email_template,
-                )
-                st.session_state.bot_on = True
-                st.rerun()
+            if not st.session_state.api_key or not st.session_state.smtp_pass:
+                st.error("Fill API key & password first.")
             else:
-                st.error("Fill in API key & password first.")
+                st.session_state.bot_on   = True
+                st.session_state.last_poll = 0.0   # poll immediately on next rerun
+                add_log("INFO", f"Bot enabled | status='{st.session_state.status_filter}' | interval={POLL_INTERVAL}s")
+                st.rerun()
     with c2:
         if st.button("⏹ Stop", disabled=not st.session_state.bot_on):
-            stop_bot()
             st.session_state.bot_on = False
+            add_log("INFO", "Bot disabled by user")
             st.rerun()
+
+# ── Poll logic (runs in main thread, gated by timer) ──────────────────────────
+now = time.time()
+seconds_since_last = now - st.session_state.last_poll
+seconds_until_next = max(0, POLL_INTERVAL - seconds_since_last)
+
+if st.session_state.bot_on:
+    if seconds_since_last >= POLL_INTERVAL:
+        # Time to poll — do it right now in the main thread
+        with st.spinner("🔍 Checking RepairShopr..."):
+            run_poll(
+                st.session_state.api_key,
+                st.session_state.smtp_pass,
+                st.session_state.status_filter,
+                st.session_state.email_template,
+            )
+        st.session_state.last_poll = time.time()
+        seconds_until_next = POLL_INTERVAL
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 status_html = (
@@ -500,21 +283,15 @@ status_html = (
     if st.session_state.bot_on else
     '<span class="bot-status bot-off"><span class="pulse"></span>BOT STOPPED</span>'
 )
-mode_label = (
-    f"Date Range: {st.session_state.date_from} → {st.session_state.date_to}"
-    if st.session_state.filter_mode == "Date Range"
-    else "Latest Status (Live)"
-)
 st.markdown(f"""
 <div class="header-bar">
   <div>
-    <h1 style="margin:0;font-family:Syne,sans-serif;font-size:1.8rem;font-weight:800;letter-spacing:0.04em;">
+    <h1 style="margin:0;font-family:Syne,sans-serif;font-size:1.8rem;font-weight:800;letter-spacing:.04em;">
       🔧 ILLEGEAR <span style="color:#ff3c3c;">REPAIR NOTIFIER</span>
     </h1>
-    <p style="margin:4px 0 0;color:#6b6b80;font-size:0.8rem;">
-      illegearticket.repairshopr.com &nbsp;·&nbsp;
+    <p style="margin:4px 0 0;color:#6b6b80;font-size:.8rem;">
+      {SUBDOMAIN}.repairshopr.com &nbsp;·&nbsp;
       <span class="filter-pill">{st.session_state.status_filter}</span>
-      <span class="filter-pill" style="background:#ff8c0020;color:#ff8c00;border-color:#ff8c00;">{mode_label}</span>
     </p>
   </div>
   <div style="margin-left:auto">{status_html}</div>
@@ -528,27 +305,28 @@ errors        = [l for l in logs if l[1] == "ERROR"]
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    st.markdown(f'<div class="metric-card"><div class="label">Customers Notified</div>'
-                f'<div class="value">{len(notified_list)}</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="metric-card"><div class="label">Customers Notified</div><div class="value">{len(notified_list)}</div></div>', unsafe_allow_html=True)
 with c2:
-    st.markdown(f'<div class="metric-card"><div class="label">Log Entries</div>'
-                f'<div class="value" style="color:#ff8c00">{len(logs)}</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="metric-card"><div class="label">Log Entries</div><div class="value" style="color:#ff8c00">{len(logs)}</div></div>', unsafe_allow_html=True)
 with c3:
     ec = "ff3c3c" if errors else "00e676"
-    st.markdown(f'<div class="metric-card"><div class="label">Errors</div>'
-                f'<div class="value" style="color:#{ec}">{len(errors)}</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="metric-card"><div class="label">Errors</div><div class="value" style="color:#{ec}">{len(errors)}</div></div>', unsafe_allow_html=True)
 with c4:
-    st.markdown('<div class="metric-card"><div class="label">Check Interval</div>'
-                f'<div class="value" style="color:#00e676;font-size:1.4rem">2 min</div></div>',
-                unsafe_allow_html=True)
+    if st.session_state.bot_on:
+        val = f'<span class="countdown">{int(seconds_until_next)}s</span>'
+        lbl = "Next Poll In"
+    else:
+        val = f'<span style="color:#6b6b80">—</span>'
+        lbl = "Next Poll In"
+    st.markdown(f'<div class="metric-card"><div class="label">{lbl}</div><div class="value" style="font-size:1.4rem">{val}</div></div>', unsafe_allow_html=True)
 
 st.markdown("---")
 
 tab1, tab2, tab3, tab4 = st.tabs(["📋 Live Logs", "✅ Notified Customers", "🔍 Manual Check", "🧪 Diagnostics"])
 
-# ── Tab 1 ──────────────────────────────────────────────────────────────────────
+# ── Tab 1: Logs ────────────────────────────────────────────────────────────────
 with tab1:
-    ca, cb = st.columns([3, 1])
+    ca, cb = st.columns([3,1])
     with ca:
         st.markdown("#### Activity Log")
     with cb:
@@ -556,239 +334,132 @@ with tab1:
             st.rerun()
     fresh = get_logs(100)
     if not fresh:
-        st.info("No activity yet. Start the bot to begin.")
+        st.info("No activity yet. Start the bot or run a manual check.")
     else:
         for ts, level, msg in fresh:
-            color = {"OK": "#00e676", "ERROR": "#ff3c3c", "INFO": "#ff8c00"}.get(level, "#6b6b80")
+            color = {"OK":"#00e676","ERROR":"#ff3c3c","INFO":"#ff8c00"}.get(level,"#6b6b80")
             st.markdown(
                 f'<div class="log-row" style="border-left-color:{color}">'
                 f'<span style="color:#6b6b80">{ts}</span> '
                 f'<span style="color:{color};font-weight:600">[{level}]</span> {msg}'
                 f'</div>', unsafe_allow_html=True)
 
-# ── Tab 2 ──────────────────────────────────────────────────────────────────────
+# ── Tab 2: Notified ────────────────────────────────────────────────────────────
 with tab2:
     st.markdown("#### Customers Successfully Notified")
     if not notified_list:
         st.info("No customers notified yet.")
     else:
-        df = pd.DataFrame(
-            notified_list,
-            columns=["Ticket #", "Customer Name", "Email", "Device", "Status", "Updated At", "Notified At"],
-        )
+        df = pd.DataFrame(notified_list,
+            columns=["Ticket #","Customer Name","Email","Device","Status","Updated At","Notified At"])
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-# ── Tab 3 ──────────────────────────────────────────────────────────────────────
+# ── Tab 3: Manual check ────────────────────────────────────────────────────────
 with tab3:
     st.markdown("#### Manual Ticket Check")
-    check_mode = st.radio(
-        "Fetch mode", ["Latest Status (Live)", "Date Range"],
-        horizontal=True, key="manual_check_mode"
-    )
-    if check_mode == "Date Range":
-        mc1, mc2 = st.columns(2)
-        with mc1:
-            manual_from = st.date_input("From", value=date.today() - timedelta(days=7), key="mf")
-        with mc2:
-            manual_to = st.date_input("To", value=date.today(), key="mt")
-    else:
-        manual_from = manual_to = None
-
-    manual_status = st.selectbox(
-        "Status to filter",
-        ["Device is Ready for Collection", "Ready for Pickup",
-         "Customer Notified", "Waiting for Parts", "Resolved", "— Show All —"],
-        key="manual_status",
-    )
+    manual_status = st.selectbox("Filter by status", [
+        "Device is Ready for Collection","Ready for Pickup",
+        "Customer Notified","Waiting for Parts","Resolved","— Show All —"], key="ms")
 
     if st.button("🔍 Fetch Tickets Now"):
         if not st.session_state.api_key:
-            st.error("Enter your API key in the sidebar first.")
+            st.error("Enter API key in sidebar first.")
         else:
-            with st.spinner("Fetching from RepairShopr..."):
-                if check_mode == "Latest Status (Live)":
-                    s = "" if manual_status == "— Show All —" else manual_status
-                    tickets = fetch_tickets_by_status(st.session_state.api_key, "illegearticket", s)
+            with st.spinner("Fetching..."):
+                s = "" if manual_status == "— Show All —" else manual_status
+                data, err = api_get(st.session_state.api_key, "tickets",
+                                    {"status": s, "per_page": 100, "page": 1})
+            if err:
+                st.error(f"API error: {err}")
+            elif data:
+                tickets = data.get("tickets", [])
+                if tickets:
+                    rows = []
+                    for t in tickets:
+                        rows.append([
+                            f"#{t.get('number','')}",
+                            t.get("customer",{}).get("fullname","—"),
+                            t.get("customer",{}).get("email","—"),
+                            t.get("subject","—")[:50],
+                            t.get("status","—"),
+                            (t.get("updated_at") or "")[:10],
+                            "✅" if already_notified(str(t.get("id"))) else "❌"
+                        ])
+                    st.dataframe(pd.DataFrame(rows,
+                        columns=["#","Customer","Email","Device","Status","Updated","Notified?"]),
+                        use_container_width=True, hide_index=True)
+                    st.success(f"Found **{len(tickets)}** ticket(s).")
                 else:
-                    raw = fetch_tickets_by_date(
-                        st.session_state.api_key, "illegearticket", manual_from, manual_to)
-                    tickets = (raw if manual_status == "— Show All —"
-                               else [t for t in raw if t.get("status") == manual_status])
+                    st.warning("No tickets found with that status.")
 
-            if tickets:
-                rows = []
-                for t in tickets:
-                    tid    = str(t.get("id"))
-                    number = t.get("number", tid)
-                    name   = t.get("customer", {}).get("fullname", "—")
-                    email  = t.get("customer", {}).get("email", "—")
-                    status = t.get("status", "—")
-                    device = t.get("subject", "—")
-                    upd    = (t.get("updated_at") or "")[:10]
-                    sent   = "✅ Yes" if already_notified(tid) else "❌ No"
-                    rows.append([f"#{number}", name, email, device, status, upd, sent])
-                df2 = pd.DataFrame(
-                    rows,
-                    columns=["Ticket #", "Customer", "Email", "Device", "Status", "Updated", "Notified?"]
-                )
-                st.dataframe(df2, use_container_width=True, hide_index=True)
-                st.success(f"Found **{len(tickets)}** ticket(s).")
-            else:
-                st.warning("No tickets found with those filters.")
-
-# ── Tab 4: Diagnostics ────────────────────────────────────────────────────────
+# ── Tab 4: Diagnostics ─────────────────────────────────────────────────────────
 with tab4:
     st.markdown("#### 🧪 Connection Diagnostics")
-    st.caption("Use these tests to pinpoint why emails are not being sent.")
-
     st.markdown("---")
 
-    # ── Test 1: API connection ──────────────────────────────────────────────
-    st.markdown("##### 1️⃣ Test RepairShopr API Key")
+    st.markdown("##### 1️⃣ Test API Key")
     if st.button("🔑 Test API Connection"):
         if not st.session_state.api_key:
-            st.error("Enter your API key in the sidebar first.")
+            st.error("Enter API key in sidebar first.")
         else:
-            with st.spinner("Connecting to RepairShopr..."):
-                try:
-                    url  = "https://illegearticket.repairshopr.com/api/v1/tickets"
-                    resp = requests.get(
-                        url,
-                        headers={"Authorization": f"Bearer {st.session_state.api_key}"},
-                        params={"per_page": 5},
-                        timeout=10,
-                    )
-                    if resp.status_code == 200:
-                        data    = resp.json()
-                        total   = data.get("meta", {}).get("total_count", "?")
-                        tickets = data.get("tickets", [])
-                        st.success(f"✅ API connected! Total tickets in system: **{total}**")
-                        if tickets:
-                            st.markdown("**Sample tickets returned:**")
-                            rows = [[t.get("number","—"), t.get("subject","—")[:60],
-                                     t.get("status","—"),
-                                     t.get("customer",{}).get("email","—")] for t in tickets]
-                            st.dataframe(
-                                pd.DataFrame(rows, columns=["#", "Subject", "Status", "Email"]),
-                                use_container_width=True, hide_index=True
-                            )
-                        else:
-                            st.warning("API connected but returned 0 tickets. Check if tickets exist.")
-                    elif resp.status_code == 401:
-                        st.error("❌ Invalid API key — 401 Unauthorized. Please check your key.")
-                    else:
-                        st.error(f"❌ API returned status {resp.status_code}: {resp.text[:200]}")
-                except Exception as e:
-                    st.error(f"❌ Could not reach RepairShopr: {e}")
-
-    st.markdown("---")
-
-    # ── Test 2: Status filter ───────────────────────────────────────────────
-    st.markdown("##### 2️⃣ Check Tickets with Exact Status")
-    st.caption(f"Looking for tickets with status = **\"{st.session_state.status_filter}\"**")
-    if st.button("🔍 Check Status Match"):
-        if not st.session_state.api_key:
-            st.error("Enter your API key in the sidebar first.")
-        else:
-            with st.spinner("Fetching tickets by status..."):
-                tickets = fetch_tickets_by_status(
-                    st.session_state.api_key, "illegearticket", st.session_state.status_filter
-                )
-            if tickets:
-                st.success(f"✅ Found **{len(tickets)}** ticket(s) with status \"{st.session_state.status_filter}\"")
-                rows = []
-                for t in tickets:
-                    rows.append([
-                        t.get("number","—"),
-                        t.get("subject","—")[:50],
-                        t.get("status","—"),
-                        t.get("customer",{}).get("email","—"),
-                        "✅ Already sent" if already_notified(str(t.get("id"))) else "❌ Not yet notified"
-                    ])
-                st.dataframe(
-                    pd.DataFrame(rows, columns=["#","Subject","Status","Email","Notified?"]),
-                    use_container_width=True, hide_index=True
-                )
+            with st.spinner("Connecting..."):
+                data, err = api_get(st.session_state.api_key, "tickets", {"per_page": 5, "page": 1})
+            if err:
+                st.error(f"❌ {err}")
             else:
-                st.error(f"❌ No tickets found with status \"{st.session_state.status_filter}\"")
-                st.info("💡 Go to RepairShopr → Admin → Ticket Statuses and copy the exact name.")
-
-                # Show all available statuses by fetching a broad sample
-                with st.spinner("Fetching all statuses currently in your tickets..."):
-                    try:
-                        resp = requests.get(
-                            "https://illegearticket.repairshopr.com/api/v1/tickets",
-                            headers={"Authorization": f"Bearer {st.session_state.api_key}"},
-                            params={"per_page": 100},
-                            timeout=10,
-                        )
-                        all_tickets = resp.json().get("tickets", [])
-                        statuses = sorted(set(t.get("status","") for t in all_tickets if t.get("status")))
-                        if statuses:
-                            st.markdown("**Statuses found in your recent tickets:**")
-                            for s in statuses:
-                                match = "✅ MATCH" if s == st.session_state.status_filter else ""
-                                st.code(f"{s}  {match}")
-                    except Exception:
-                        pass
+                tickets = data.get("tickets", [])
+                total   = data.get("meta", {}).get("total_count", "?")
+                st.success(f"✅ API connected! Total tickets: **{total}**")
+                if tickets:
+                    # Show what statuses exist
+                    data2, _ = api_get(st.session_state.api_key, "tickets", {"per_page": 100, "page": 1})
+                    all_t = data2.get("tickets", []) if data2 else []
+                    statuses = sorted(set(t.get("status","") for t in all_t if t.get("status")))
+                    st.markdown("**Statuses in your recent tickets:**")
+                    for s in statuses:
+                        match = " ← ✅ MATCHES trigger" if s == st.session_state.status_filter else ""
+                        st.code(f"{s}{match}")
 
     st.markdown("---")
-
-    # ── Test 3: Email SMTP ──────────────────────────────────────────────────
-    st.markdown("##### 3️⃣ Test Email Sending")
-    test_email = st.text_input("Send test email to", placeholder="youremail@example.com")
+    st.markdown("##### 2️⃣ Test Email (SMTP)")
+    test_to = st.text_input("Send test to", placeholder="youremail@example.com")
     if st.button("📧 Send Test Email"):
         if not st.session_state.smtp_pass:
-            st.error("Enter your email password in the sidebar first.")
-        elif not test_email:
-            st.error("Enter a recipient email above.")
+            st.error("Enter email password in sidebar first.")
+        elif not test_to:
+            st.error("Enter a recipient email.")
         else:
-            with st.spinner(f"Sending test email to {test_email}..."):
-                try:
-                    msg = MIMEMultipart("alternative")
-                    msg["Subject"] = "✅ Illegear Notifier — SMTP Test"
-                    msg["From"]    = "Illegear Support <support@illegear.com>"
-                    msg["To"]      = test_email
-                    msg.attach(MIMEText(
-                        "This is a test email from your Illegear Repair Notifier bot.\n"
-                        "If you received this, SMTP is working correctly!", "plain"
-                    ))
-                    msg.attach(MIMEText("""
-                        <div style="font-family:Arial,sans-serif;padding:24px;background:#0a0a0f;
-                                    color:#e8e8f0;border-radius:8px;max-width:480px">
-                          <h2 style="color:#ff3c3c;">✅ SMTP Test Successful</h2>
-                          <p>Your Illegear Repair Notifier email system is working correctly.</p>
-                          <p style="color:#6b6b80;font-size:12px;">
-                            Sent from: support@illegear.com via mail.illegear.com</p>
-                        </div>""", "html"
-                    ))
-                    with smtplib.SMTP("mail.illegear.com", 587) as server:
-                        server.starttls()
-                        server.login("support@illegear.com", st.session_state.smtp_pass)
-                        server.sendmail("support@illegear.com", test_email, msg.as_string())
-                    st.success(f"✅ Test email sent to **{test_email}**! Check your inbox.")
-                    add_log("OK", f"SMTP test email sent to {test_email}")
-                except smtplib.SMTPAuthenticationError:
-                    st.error("❌ Authentication failed — wrong email password. Check your credentials.")
-                    add_log("ERROR", "SMTP test failed: authentication error")
-                except smtplib.SMTPConnectError:
-                    st.error("❌ Could not connect to mail.illegear.com:587 — server unreachable.")
-                    add_log("ERROR", "SMTP test failed: connection error")
-                except Exception as e:
-                    st.error(f"❌ Email failed: {e}")
-                    add_log("ERROR", f"SMTP test failed: {e}")
+            with st.spinner(f"Sending to {test_to}..."):
+                ok, err = send_email(
+                    st.session_state.smtp_pass, test_to,
+                    "Test Customer", "0000", "Test Device",
+                    "Hi {name}, this is a test email from Illegear Notifier. Ticket #{ticket}."
+                )
+            if ok:
+                st.success(f"✅ Test email sent to **{test_to}**! Check your inbox.")
+                add_log("OK", f"SMTP test sent to {test_to}")
+            else:
+                st.error(f"❌ Failed: {err}")
+                add_log("ERROR", f"SMTP test failed: {err}")
 
     st.markdown("---")
-    st.markdown("##### 📋 Quick Summary")
-    st.markdown("""
-| Check | What to do if it fails |
-|---|---|
-| **API Key** | Regenerate key in RepairShopr → Admin → API Keys |
-| **Status Match** | Copy exact status name from RepairShopr → Admin → Ticket Statuses |
-| **Email SMTP** | Check password, or try port 465 SSL instead of 587 |
-""")
+    st.markdown("##### 3️⃣ Run One Poll Now")
+    st.caption("Manually trigger one scan without waiting for the timer.")
+    if st.button("▶ Run Poll Now"):
+        if not st.session_state.api_key or not st.session_state.smtp_pass:
+            st.error("Fill in API key and password first.")
+        else:
+            with st.spinner("Polling..."):
+                run_poll(
+                    st.session_state.api_key, st.session_state.smtp_pass,
+                    st.session_state.status_filter, st.session_state.email_template
+                )
+            st.session_state.last_poll = time.time()
+            st.success("Poll complete — check Live Logs tab.")
+            st.rerun()
 
-# ── Auto-refresh (safe — only refreshes UI, bot thread is already protected) ──
+# ── Auto-rerun to count down timer (only when bot is on) ──────────────────────
 if st.session_state.bot_on:
-    time.sleep(5)
+    # Rerun every 10s to update the countdown and trigger polls when due
+    time.sleep(10)
     st.rerun()
