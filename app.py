@@ -711,8 +711,6 @@ with tab4:
             st.rerun()
 
 # ── Auto‑refresh while bot is running (no blocking sleep) ───────────────────────
-import time
-import streamlit as st
 
 # ... inside your logic ...
 
