@@ -711,5 +711,18 @@ with tab4:
             st.rerun()
 
 # ── Auto‑refresh while bot is running (no blocking sleep) ───────────────────────
-from streamlit_autorefresh import st_autorefresh
-st_autorefresh(interval=10000, key="bot_refresh")
+import time
+import streamlit as st
+
+# ... inside your logic ...
+
+if st.session_state.bot_on:
+    # Wait for 10 seconds
+    time.sleep(10)
+    
+    # Modern Streamlit (v1.27.0+) uses st.rerun()
+    # Older versions used st.experimental_rerun()
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
