@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 """
 Illegear Repair Notifier
 ========================
@@ -10,13 +13,13 @@ import requests
 import smtplib
 import sqlite3
 import time
+import json                           # ← added
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
 import pandas as pd
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-# You can move these values into `.streamlit/secrets.toml` if you prefer.
 SUBDOMAIN     = "illegearticket"
 FROM_EMAIL    = "support@illegear.com"
 SMTP_HOST     = "mail.illegear.com"
@@ -71,8 +74,6 @@ section[data-testid="stSidebar"]{background-color:var(--surface)!important;borde
 )
 
 # ── Database (singleton) ───────────────────────────────────────────────────────
-# Streamlit renamed the old `st.experimental_singleton` to `st.cache_resource`.
-# We use whichever attribute exists, so the code works on both old and new versions.
 if hasattr(st, "cache_resource"):
     _cache_res = st.cache_resource
 else:                         # fallback for very old Streamlit releases
@@ -167,7 +168,6 @@ def get_notified_list():
     ).fetchall()
 
 
-# Optional: prune old logs so the DB does not grow forever
 MAX_LOG_ROWS = 10_000
 
 
@@ -221,13 +221,13 @@ def send_email(smtp_pass, to_email, customer_name, ticket_number, device, templa
     msg["From"] = f"Illegear Support <{FROM_EMAIL}>"
     msg["To"] = to_email
 
-    # Plain‑text fallback
+    # Plain‑text fallback (template uses {name}, {ticket}, {device})
     body = (
         template.replace("{name}", customer_name)
         .replace("{ticket}", str(ticket_number))
         .replace("{device}", device or "your device")
     )
-    # Fancy HTML version
+    # Fancy HTML version (kept exactly as you wrote it)
     html = f"""
     <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;
                 background:#0a0a0f;color:#e8e8f0;border-radius:10px;overflow:hidden;">
@@ -260,6 +260,61 @@ def send_email(smtp_pass, to_email, customer_name, ticket_number, device, templa
         return False, str(e)
 
 
+# ── Helper: robust extraction of name & e‑mail ──────────────────────────────────
+def _extract_contact(ticket: dict) -> tuple[str, str]:
+    """
+    Try every known place where RepairShopr stores a contact name / e‑mail.
+    Returns (name, email).  ``email`` may be an empty string → the bot will skip.
+    """
+    # 1️⃣ Customer object (most common)
+    cust = ticket.get("customer") or {}
+    name = (
+        cust.get("fullname")
+        or cust.get("name")
+        or f"{cust.get('firstname','')} {cust.get('lastname','')}".strip()
+    )
+    email = cust.get("email")
+
+    # 2️⃣ Contact object (when no linked Customer)
+    if not email:
+        contact = ticket.get("contact") or {}
+        email = contact.get("email")
+        if not name:
+            name = f"{contact.get('firstname','')} {contact.get('lastname','')}".strip()
+
+    # 3️⃣ Legacy “requester” field
+    if not email:
+        requester = ticket.get("requester") or {}
+        email = requester.get("email")
+        if not name:
+            name = requester.get("name")
+
+    # 4️⃣ Root‑level shortcuts
+    if not email:
+        email = ticket.get("email") or ticket.get("contact_email")
+    if not name:
+        name = ticket.get("name") or ticket.get("customer_name")
+
+    # 5️⃣ Custom fields (replace <YOUR_…> with the actual field keys if you use them)
+    if not email:
+        cf = ticket.get("custom_fields", {})
+        email = cf.get("client_email") or cf.get("<YOUR_EMAIL_FIELD_ID>")
+    if not name:
+        cf = ticket.get("custom_fields", {})
+        name = cf.get("client_name") or cf.get("<YOUR_NAME_FIELD_ID>")
+
+    # Normalise
+    name = (name or "").strip() or "Customer"
+    email = (email or "").strip()
+
+    # DEBUG – tells you which path succeeded
+    add_log(
+        "DEBUG",
+        f"Extracted contact → ticket #{ticket.get('number','?')}: name='{name}' email='{email or '—'}'",
+    )
+    return name, email
+
+
 # ── Core poll function (no threads) ─────────────────────────────────────────────
 def run_poll(api_key, smtp_pass, status_filter, template):
     """One full scan: fetch tickets → send emails → log results."""
@@ -270,23 +325,24 @@ def run_poll(api_key, smtp_pass, status_filter, template):
         return
 
     new_count = 0
-    for t in tickets:
+    for idx, t in enumerate(tickets):
         tid = str(t.get("id"))
+        # DEBUG: dump first two tickets so you can see the raw payload
+        if idx < 2:
+            add_log(
+                "DEBUG",
+                f"TICKET RAW {tid}: {json.dumps(t, default=str)[:500]}…",
+            )
+
         number = str(t.get("number", tid))
-        cust = t.get("customer") or {}
-        name = (
-            cust.get("fullname")
-            or cust.get("name")
-            or f"{cust.get('firstname','')} {cust.get('lastname','')}".strip()
-            or t.get("customer_firstname", "")
-            or "Customer"
-        ).strip() or "Customer"
-        email = cust.get("email") or t.get("customer_email") or t.get("contact_email", "")
         device = t.get("subject", "")
         status = t.get("status", "")
         upd = (t.get("updated_at") or "")[:19]
 
-        # Skip if already processed or no e‑mail address
+        # ---- Use the robust extractor ---------------------------------
+        name, email = _extract_contact(t)
+
+        # Skip if already processed or if there is **no** e‑mail address
         if not email or already_notified(tid):
             continue
 
@@ -302,7 +358,7 @@ def run_poll(api_key, smtp_pass, status_filter, template):
         "INFO",
         f"Scan done — {len(tickets)} ticket(s) matched, {new_count} new notification(s)",
     )
-    prune_logs()  # keep the log table tidy
+    prune_logs()
 
 
 # ── Session‑state helpers ─────────────────────────────────────────────────────
@@ -552,56 +608,28 @@ with tab3:
             elif data:
                 tickets = data.get("tickets", [])
                 if tickets:
-                    first = tickets[0]
-                    with st.expander("🔬 Raw API fields (first ticket)"):
-                        st.json(
-                            {
-                                k: v
-                                for k, v in first.items()
-                                if k
-                                in [
-                                    "id",
-                                    "number",
-                                    "status",
-                                    "subject",
-                                    "updated_at",
-                                    "customer",
-                                    "customer_id",
-                                    "name",
-                                    "email",
-                                    "contact_email",
-                                    "firstname",
-                                    "lastname",
-                                    "fullname",
-                                    "customer_firstname",
-                                    "customer_lastname",
-                                    "customer_email",
-                                ]
-                            }
-                        )
+                    # ----- NEW: show the whole first ticket JSON -----
+                    with st.expander("🔬 Full JSON of the first ticket"):
+                        st.json(tickets[0])
+
                     rows = []
                     for t in tickets:
-                        cust = t.get("customer") or {}
-                        name = (
-                            cust.get("fullname")
-                            or cust.get("name")
-                            or f"{cust.get('firstname','')} {cust.get('lastname','')}".strip()
-                            or t.get("customer_firstname", "")
-                            or t.get("name", "—")
-                        ).strip()
-                        email = (
-                            cust.get("email")
-                            or t.get("customer_email")
-                            or t.get("contact_email", "—")
-                        )
+                        number = f"#{t.get('number','')}"
+                        device = t.get("subject", "—")
+                        status = t.get("status", "—")
+                        updated = (t.get("updated_at") or "")[:10]
+
+                        # Use the robust extractor for name/email
+                        name, email = _extract_contact(t)
+
                         rows.append(
                             [
-                                f"#{t.get('number','')}",
+                                number,
                                 name,
-                                email,
-                                t.get("subject", "—")[:50],
-                                t.get("status", "—"),
-                                (t.get("updated_at") or "")[:10],
+                                email or "—",
+                                device[:50],
+                                status,
+                                updated,
                                 "✅" if already_notified(str(t.get("id"))) else "❌",
                             ]
                         )
@@ -647,6 +675,7 @@ with tab4:
                 total = data.get("meta", {}).get("total_count", "?")
                 st.success(f"✅ API connected! Total tickets: **{total}**")
                 if tickets:
+                    # show a few recent statuses – useful to verify your trigger
                     data2, _ = api_get(
                         st.session_state.api_key, "tickets", {"per_page": 100, "page": 1}
                     )
@@ -656,11 +685,7 @@ with tab4:
                     )
                     st.markdown("**Statuses in recent tickets:**")
                     for s in statuses:
-                        note = (
-                            " ← ✅ MATCHES trigger"
-                            if s == st.session_state.status_filter
-                            else ""
-                        )
+                        note = " ← ✅ MATCHES trigger" if s == st.session_state.status_filter else ""
                         st.code(f"{s}{note}")
 
     st.markdown("---")
@@ -672,7 +697,7 @@ with tab4:
         if not st.session_state.smtp_pass:
             st.error("Enter email password in sidebar first.")
         elif not test_to:
-            st.error("Enter a recipient email.")
+            st.error("Enter a recipient e‑mail.")
         else:
             with st.spinner(f"Sending to {test_to}…"):
                 ok, err = send_email(
@@ -684,7 +709,7 @@ with tab4:
                     "Hi {name}, this is a test email from Illegear Notifier. Ticket #{ticket}.",
                 )
             if ok:
-                st.success(f"✅ Test email sent to **{test_to}**! Check your inbox.")
+                st.success(f"✅ Test e‑mail sent to **{test_to}**! Check your inbox.")
                 add_log("OK", f"SMTP test sent to {test_to}")
             else:
                 st.error(f"❌ Failed: {err}")
@@ -711,15 +736,9 @@ with tab4:
             st.rerun()
 
 # ── Auto‑refresh while bot is running (no blocking sleep) ───────────────────────
-
-# ... inside your logic ...
-
 if st.session_state.bot_on:
-    # Wait for 10 seconds
+    # Light‑weight wait – refreshes UI every 10 s while the bot is active
     time.sleep(10)
-    
-    # Modern Streamlit (v1.27.0+) uses st.rerun()
-    # Older versions used st.experimental_rerun()
     if hasattr(st, "rerun"):
         st.rerun()
     else:
