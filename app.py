@@ -711,17 +711,5 @@ with tab4:
             st.rerun()
 
 # ── Auto‑refresh while bot is running (no blocking sleep) ───────────────────────
-if st.session_state.bot_on:
-    # Newer Streamlit versions expose `st.experimental_autorefresh`.
-    # Older versions raise AttributeError, so we fall back to a simple
-    #   time‑sleep + st.experimental_rerun()  (it blocks the UI for a few seconds
-    #   but still gives you the periodic refresh you need).
-    if hasattr(st, "experimental_autorefresh"):
-        # interval is in milliseconds
-        st.experimental_autorefresh(interval=10_000, limit=None, key="bot_refresh")
-    else:
-        # ----- fallback for very old Streamlit releases -----
-        # Show a tiny placeholder so the UI isn’t completely frozen while we sleep.
-        _ = st.empty()
-        time.sleep(10)          # wait 10 seconds
-        st.experimental_rerun()  # or st.rerun() on the newest releases
+from streamlit_autorefresh import st_autorefresh
+st_autorefresh(interval=10000, key="bot_refresh")
