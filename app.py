@@ -16,8 +16,7 @@ from datetime import datetime, date, timedelta
 import pandas as pd
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-# You can also move these into `.streamlit/secrets.toml` and read them via
-# `st.secrets["notifier"]["..."]`.
+# You can move these values into `.streamlit/secrets.toml` if you prefer.
 SUBDOMAIN     = "illegearticket"
 FROM_EMAIL    = "support@illegear.com"
 SMTP_HOST     = "mail.illegear.com"
@@ -72,11 +71,19 @@ section[data-testid="stSidebar"]{background-color:var(--surface)!important;borde
 )
 
 # ── Database (singleton) ───────────────────────────────────────────────────────
-@st.experimental_singleton
+# Streamlit renamed the old `st.experimental_singleton` to `st.cache_resource`.
+# We use whichever attribute exists, so the code works on both old and new versions.
+if hasattr(st, "cache_resource"):
+    _cache_res = st.cache_resource
+else:                         # fallback for very old Streamlit releases
+    _cache_res = st.experimental_singleton
+
+
+@_cache_res
 def get_db():
     """Create (or reuse) a single SQLite connection for the app lifetime."""
     conn = sqlite3.connect("notifier.db", check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")   # safe for concurrent reads
+    conn.execute("PRAGMA journal_mode=WAL;")  # safe for concurrent reads
     conn.execute(
         """CREATE TABLE IF NOT EXISTS notified (
             ticket_id TEXT PRIMARY KEY,
@@ -97,7 +104,7 @@ def get_db():
             message TEXT
         )"""
     )
-    # Back‑compat: add missing columns if an older DB is detected
+    # Back‑compatibility: add missing columns if an older DB is detected
     cols = [r[1] for r in conn.execute("PRAGMA table_info(notified)").fetchall()]
     for col in ["device", "status", "updated_at"]:
         if col not in cols:
@@ -110,17 +117,20 @@ DB = get_db()
 
 # ----- DB helper wrappers -------------------------------------------------
 def already_notified(ticket_id: str) -> bool:
-    """Return True if we have already sent a notification for this ticket."""
-    return DB.execute("SELECT 1 FROM notified WHERE ticket_id=?", (ticket_id,)).fetchone() is not None
+    """True if this ticket has already been processed."""
+    return (
+        DB.execute("SELECT 1 FROM notified WHERE ticket_id=?", (ticket_id,)).fetchone()
+        is not None
+    )
 
 
 def mark_notified(ticket_id, name, email, number, device, status, updated_at):
-    """Insert a record that this ticket has been processed."""
+    """Insert a row indicating we have sent a notification for this ticket."""
     DB.execute(
-        """INSERT OR IGNORE INTO notified
-        (ticket_id, customer_name, customer_email, ticket_number,
-         device, status, updated_at, notified_at)
-        VALUES (?,?,?,?,?,?,?,?)""",
+        """INSERT OR IGNORE INTO notified (
+            ticket_id, customer_name, customer_email, ticket_number,
+            device, status, updated_at, notified_at
+        ) VALUES (?,?,?,?,?,?,?,?)""",
         (
             str(ticket_id),
             name,
@@ -157,7 +167,7 @@ def get_notified_list():
     ).fetchall()
 
 
-# Optional: prune old logs (keeps DB size reasonable)
+# Optional: prune old logs so the DB does not grow forever
 MAX_LOG_ROWS = 10_000
 
 
@@ -192,7 +202,7 @@ def api_get(api_key, path, params=None):
 
 
 def fetch_ready_tickets(api_key, status_filter):
-    """Return tickets with the configured status (page 1 only)."""
+    """Return tickets that match the configured status (page 1 only)."""
     data, err = api_get(
         api_key,
         "tickets",
@@ -205,7 +215,7 @@ def fetch_ready_tickets(api_key, status_filter):
 
 # ── Email ──────────────────────────────────────────────────────────────────────
 def send_email(smtp_pass, to_email, customer_name, ticket_number, device, template):
-    """Send a multipart (plain + HTML) email via the configured SMTP server."""
+    """Send a multipart (plain + HTML) email via the configured SMTP server."""
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Your device is ready for collection! Ticket #{ticket_number}"
     msg["From"] = f"Illegear Support <{FROM_EMAIL}>"
@@ -276,7 +286,7 @@ def run_poll(api_key, smtp_pass, status_filter, template):
         status = t.get("status", "")
         upd = (t.get("updated_at") or "")[:19]
 
-        # Skip if we have no address or we already notified this ticket
+        # Skip if already processed or no e‑mail address
         if not email or already_notified(tid):
             continue
 
@@ -292,10 +302,10 @@ def run_poll(api_key, smtp_pass, status_filter, template):
         "INFO",
         f"Scan done — {len(tickets)} ticket(s) matched, {new_count} new notification(s)",
     )
-    prune_logs()  # keep the logs table from growing forever
+    prune_logs()  # keep the log table tidy
 
 
-# ── Session state helpers ─────────────────────────────────────────────────────
+# ── Session‑state helpers ─────────────────────────────────────────────────────
 def _ss(key, default):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -542,7 +552,6 @@ with tab3:
             elif data:
                 tickets = data.get("tickets", [])
                 if tickets:
-                    # Show a preview of the first ticket's fields (debug help)
                     first = tickets[0]
                     with st.expander("🔬 Raw API fields (first ticket)"):
                         st.json(
@@ -570,7 +579,6 @@ with tab3:
                                 ]
                             }
                         )
-
                     rows = []
                     for t in tickets:
                         cust = t.get("customer") or {}
@@ -594,9 +602,7 @@ with tab3:
                                 t.get("subject", "—")[:50],
                                 t.get("status", "—"),
                                 (t.get("updated_at") or "")[:10],
-                                "✅"
-                                if already_notified(str(t.get("id")))
-                                else "❌",
+                                "✅" if already_notified(str(t.get("id"))) else "❌",
                             ]
                         )
                     st.dataframe(
@@ -631,7 +637,9 @@ with tab4:
             st.error("Enter API key in sidebar first.")
         else:
             with st.spinner("Connecting..."):
-                data, err = api_get(st.session_state.api_key, "tickets", {"per_page": 5, "page": 1})
+                data, err = api_get(
+                    st.session_state.api_key, "tickets", {"per_page": 5, "page": 1}
+                )
             if err:
                 st.error(f"❌ {err}")
             else:
@@ -639,7 +647,6 @@ with tab4:
                 total = data.get("meta", {}).get("total_count", "?")
                 st.success(f"✅ API connected! Total tickets: **{total}**")
                 if tickets:
-                    # Show which statuses appear in the most recent tickets
                     data2, _ = api_get(
                         st.session_state.api_key, "tickets", {"per_page": 100, "page": 1}
                     )
@@ -649,7 +656,11 @@ with tab4:
                     )
                     st.markdown("**Statuses in recent tickets:**")
                     for s in statuses:
-                        note = " ← ✅ MATCHES trigger" if s == st.session_state.status_filter else ""
+                        note = (
+                            " ← ✅ MATCHES trigger"
+                            if s == st.session_state.status_filter
+                            else ""
+                        )
                         st.code(f"{s}{note}")
 
     st.markdown("---")
@@ -681,7 +692,7 @@ with tab4:
 
     st.markdown("---")
 
-    # ---- 3️⃣ Run a single poll --------------------------------------------
+    # ---- 3️⃣ Run one poll --------------------------------------------------
     st.markdown("##### 3️⃣ Run One Poll Now")
     st.caption("Manually trigger one scan without waiting for the timer.")
     if st.button("▶ Run Poll Now"):
