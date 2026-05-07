@@ -13,7 +13,7 @@ import requests
 import smtplib
 import sqlite3
 import time
-import json                           # ← added
+import json                         # ← added
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
@@ -221,13 +221,13 @@ def send_email(smtp_pass, to_email, customer_name, ticket_number, device, templa
     msg["From"] = f"Illegear Support <{FROM_EMAIL}>"
     msg["To"] = to_email
 
-    # Plain‑text fallback (template uses {name}, {ticket}, {device})
+    # Plain‑text fallback
     body = (
         template.replace("{name}", customer_name)
         .replace("{ticket}", str(ticket_number))
         .replace("{device}", device or "your device")
     )
-    # Fancy HTML version (kept exactly as you wrote it)
+    # Fancy HTML version
     html = f"""
     <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;
                 background:#0a0a0f;color:#e8e8f0;border-radius:10px;overflow:hidden;">
@@ -260,13 +260,15 @@ def send_email(smtp_pass, to_email, customer_name, ticket_number, device, templa
         return False, str(e)
 
 
-# ── Helper: robust extraction of name & e‑mail ──────────────────────────────────
+# ── Helper: robust extraction of name & e‑mail ─────────────────────────────────────
 def _extract_contact(ticket: dict) -> tuple[str, str]:
     """
     Try every known place where RepairShopr stores a contact name / e‑mail.
-    Returns (name, email).  ``email`` may be an empty string → the bot will skip.
+    Returns (name, email).  ``email`` may be empty → the bot will skip that ticket.
     """
+    # -----------------------------------------------------------------
     # 1️⃣ Customer object (most common)
+    # -----------------------------------------------------------------
     cust = ticket.get("customer") or {}
     name = (
         cust.get("fullname")
@@ -275,39 +277,67 @@ def _extract_contact(ticket: dict) -> tuple[str, str]:
     )
     email = cust.get("email")
 
-    # 2️⃣ Contact object (when no linked Customer)
+    # -----------------------------------------------------------------
+    # 2️⃣ Contact object (when there is no linked Customer)
+    # -----------------------------------------------------------------
     if not email:
         contact = ticket.get("contact") or {}
         email = contact.get("email")
         if not name:
             name = f"{contact.get('firstname','')} {contact.get('lastname','')}".strip()
 
+    # -----------------------------------------------------------------
     # 3️⃣ Legacy “requester” field
+    # -----------------------------------------------------------------
     if not email:
         requester = ticket.get("requester") or {}
         email = requester.get("email")
         if not name:
             name = requester.get("name")
 
+    # -----------------------------------------------------------------
     # 4️⃣ Root‑level shortcuts
+    # -----------------------------------------------------------------
     if not email:
         email = ticket.get("email") or ticket.get("contact_email")
     if not name:
         name = ticket.get("name") or ticket.get("customer_name")
 
-    # 5️⃣ Custom fields (replace <YOUR_…> with the actual field keys if you use them)
+    # -----------------------------------------------------------------
+    # 5️⃣ **COMMENTS → destination_emails** (the field you posted)
+    # -----------------------------------------------------------------
+    if not email:
+        comments = ticket.get("comments", [])
+        if comments:
+            first = comments[0]                     # dict
+            dest = first.get("destination_emails")  # e.g. "john@example.com, bob@…"
+            if dest:
+                possible = [e.strip() for e in dest.split(",") if e.strip()]
+                if possible:
+                    email = possible[0]
+
+    # -----------------------------------------------------------------
+    # 6️⃣ Custom fields (if you store e‑mail there)
+    # -----------------------------------------------------------------
     if not email:
         cf = ticket.get("custom_fields", {})
         email = cf.get("client_email") or cf.get("<YOUR_EMAIL_FIELD_ID>")
-    if not name:
-        cf = ticket.get("custom_fields", {})
-        name = cf.get("client_name") or cf.get("<YOUR_NAME_FIELD_ID>")
 
-    # Normalise
+    # -----------------------------------------------------------------
+    # 7️⃣ Optional fallback to the staff user that created the ticket
+    # -----------------------------------------------------------------
+    # (Usually you **don’t** want to send to this address, but the code is kept
+    # here in case you ever need it.)
+    if not email:
+        user = ticket.get("user") or {}
+        email = user.get("email")
+
+    # -----------------------------------------------------------------
+    # 8️⃣ Normalise & log what was finally used
+    # -----------------------------------------------------------------
     name = (name or "").strip() or "Customer"
     email = (email or "").strip()
 
-    # DEBUG – tells you which path succeeded
     add_log(
         "DEBUG",
         f"Extracted contact → ticket #{ticket.get('number','?')}: name='{name}' email='{email or '—'}'",
@@ -327,7 +357,8 @@ def run_poll(api_key, smtp_pass, status_filter, template):
     new_count = 0
     for idx, t in enumerate(tickets):
         tid = str(t.get("id"))
-        # DEBUG: dump first two tickets so you can see the raw payload
+
+        # DEBUG: keep a tiny snippet of the raw ticket for the first two tickets
         if idx < 2:
             add_log(
                 "DEBUG",
@@ -342,7 +373,7 @@ def run_poll(api_key, smtp_pass, status_filter, template):
         # ---- Use the robust extractor ---------------------------------
         name, email = _extract_contact(t)
 
-        # Skip if already processed or if there is **no** e‑mail address
+        # Skip if we already processed it or if there is **no** e‑mail address
         if not email or already_notified(tid):
             continue
 
@@ -608,7 +639,7 @@ with tab3:
             elif data:
                 tickets = data.get("tickets", [])
                 if tickets:
-                    # ----- NEW: show the whole first ticket JSON -----
+                    # ---- NEW: show raw JSON of the first ticket ----
                     with st.expander("🔬 Full JSON of the first ticket"):
                         st.json(tickets[0])
 
@@ -619,7 +650,7 @@ with tab3:
                         status = t.get("status", "—")
                         updated = (t.get("updated_at") or "")[:10]
 
-                        # Use the robust extractor for name/email
+                        # Use the robust extractor for name & e‑mail
                         name, email = _extract_contact(t)
 
                         rows.append(
@@ -675,7 +706,6 @@ with tab4:
                 total = data.get("meta", {}).get("total_count", "?")
                 st.success(f"✅ API connected! Total tickets: **{total}**")
                 if tickets:
-                    # show a few recent statuses – useful to verify your trigger
                     data2, _ = api_get(
                         st.session_state.api_key, "tickets", {"per_page": 100, "page": 1}
                     )
