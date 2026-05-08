@@ -30,19 +30,31 @@ POLL_INTERVAL = 120   # seconds between API polls (2 min – safely under 180 re
 # ── Email validation ───────────────────────────────────────────────────────────
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-# All internal/staff addresses that must NEVER receive customer notifications
+# Exact internal addresses that must NEVER receive customer notifications
 EXCLUDED_EMAILS = {
     FROM_EMAIL.lower(),
     "support@illegear.com",
 }
 
+# Entire domains whose addresses are always internal — blocks ALL @illegear.com staff
+EXCLUDED_DOMAINS = {
+    "illegear.com",
+}
+
+
 def _is_valid_customer_email(email: str) -> bool:
-    """Return True only if the address is a well-formed, non-internal email."""
+    """Return True only if the address is well-formed and NOT an internal/staff address."""
     if not email:
         return False
     e = email.strip().lower()
+    # Block known exact internal addresses
     if e in EXCLUDED_EMAILS:
         return False
+    # Block entire internal domain — catches every @illegear.com variation
+    domain = e.split("@")[-1] if "@" in e else ""
+    if domain in EXCLUDED_DOMAINS:
+        return False
+    # Must match basic email format
     return bool(_EMAIL_RE.match(e))
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -253,6 +265,10 @@ def fetch_ready_tickets(api_key, status_filter, date_from=None, date_to=None):
 # ── Email ──────────────────────────────────────────────────────────────────────
 def send_email(smtp_pass, to_email, customer_name, ticket_number, device, template):
     """Send a multipart (plain + HTML) email via the configured SMTP server."""
+    # ── Hard safety gate — NEVER send to internal/sender addresses ──────────
+    if not _is_valid_customer_email(to_email):
+        return False, f"Blocked: '{to_email}' is an internal or invalid address — not sent"
+    # ────────────────────────────────────────────────────────────────────────
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Your device is ready for collection! Ticket #{ticket_number}"
     msg["From"] = f"Illegear Support <{FROM_EMAIL}>"
@@ -282,7 +298,6 @@ def send_email(smtp_pass, to_email, customer_name, ticket_number, device, templa
         <p style="font-size:15px;line-height:1.6;">
           Good news! Your device has been repaired and is now
           <strong style="color:#cc0000;">ready for collection</strong>.
-          If you already collect the Device, we are sorry for your inconvenience.
         </p>
 
         <!-- Ticket Info Box -->
@@ -435,9 +450,13 @@ def run_poll(api_key, smtp_pass, status_filter, template, date_from=None, date_t
         name, email = _extract_contact(t)
 
         # Skip: no email, invalid/internal email, or already notified
-        if not email or not _is_valid_customer_email(email) or already_notified(tid):
-            if email and not _is_valid_customer_email(email):
-                add_log("WARN", f"Skipped ticket #{number} — invalid/internal email: '{email}'")
+        if already_notified(tid):
+            continue
+        if not email:
+            add_log("WARN", f"Skipped ticket #{number} — no customer email found")
+            continue
+        if not _is_valid_customer_email(email):
+            add_log("WARN", f"Skipped ticket #{number} — blocked internal/invalid email: '{email}'")
             continue
 
         ok, err2 = send_email(smtp_pass, email, name, number, device, template)
