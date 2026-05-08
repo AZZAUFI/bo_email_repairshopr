@@ -215,38 +215,68 @@ def fetch_ready_tickets(api_key, status_filter):
 
 # ── Email ──────────────────────────────────────────────────────────────────────
 def send_email(smtp_pass, to_email, customer_name, ticket_number, device, template):
-    """Send a multipart (plain + HTML) email via the configured SMTP server."""
+    """Send a multipart (plain + HTML) email via the configured SMTP server."""
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Your device is ready for collection! Ticket #{ticket_number}"
     msg["From"] = f"Illegear Support <{FROM_EMAIL}>"
     msg["To"] = to_email
 
-    # Plain‑text fallback
+    # Plain-text fallback
     body = (
         template.replace("{name}", customer_name)
         .replace("{ticket}", str(ticket_number))
         .replace("{device}", device or "your device")
     )
-    # Fancy HTML version
+
+    # Clean HTML version
     html = f"""
-    <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;
-                background:#0a0a0f;color:#e8e8f0;border-radius:10px;overflow:hidden;">
-      <div style="background:#ff3c3c;padding:28px 32px;">
-        <h1 style="margin:0;font-size:22px;color:white;">Illegear Repair</h1>
-        <p style="margin:4px 0 0;color:#ffaaaa;font-size:13px;">Device Ready for Collection</p>
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;background:#ffffff;
+                border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;">
+
+      <!-- Header -->
+      <div style="background:#cc0000;padding:24px 32px;">
+        <h1 style="margin:0;font-size:20px;color:#ffffff;letter-spacing:0.5px;">Illegear Repair</h1>
+        <p style="margin:4px 0 0;color:#ffcccc;font-size:13px;">Device Ready for Collection</p>
       </div>
-      <div style="padding:32px;">
-        <p>Hi <strong>{customer_name}</strong>,</p>
-        <p>Your device is <strong style="color:#00e676;">ready for collection</strong>.</p>
-        <div style="background:#12121a;border:1px solid #1e1e2e;border-radius:6px;padding:16px;margin:20px 0;">
-          <p style="margin:0 0 4px;color:#6b6b80;font-size:11px;text-transform:uppercase;">Ticket</p>
-          <p style="margin:0;font-size:20px;font-weight:bold;color:#ff3c3c;">#{ticket_number}</p>
-          <p style="margin:4px 0 0;color:#aaa;">{device or 'Your device'}</p>
+
+      <!-- Body -->
+      <div style="padding:32px;color:#333333;">
+        <p style="font-size:15px;">Hi <strong>{customer_name}</strong>,</p>
+        <p style="font-size:15px;line-height:1.6;">
+          Good news! Your device has been repaired and is now
+          <strong style="color:#cc0000;">ready for collection</strong>.
+        </p>
+
+        <!-- Ticket Info Box -->
+        <div style="background:#f7f7f7;border-left:4px solid #cc0000;
+                    border-radius:4px;padding:16px 20px;margin:24px 0;">
+          <p style="margin:0 0 4px;font-size:11px;color:#888888;text-transform:uppercase;
+                    letter-spacing:0.8px;">Repair Ticket</p>
+          <p style="margin:0;font-size:22px;font-weight:bold;color:#cc0000;">#{ticket_number}</p>
+          <p style="margin:6px 0 0;font-size:13px;color:#555555;">{device or 'Your device'}</p>
         </div>
-        <p>Please bring this ticket number when collecting your device.</p>
-        <p style="color:#6b6b80;font-size:12px;">— Illegear Support<br>{FROM_EMAIL}</p>
+
+        <p style="font-size:14px;color:#444444;line-height:1.6;">
+          Please bring this ticket number when collecting your device from our service centre.
+          If you have any questions, feel free to reply to this email.
+        </p>
+
+        <p style="font-size:14px;color:#444444;margin-top:28px;">
+          Thank you for choosing Illegear.<br>
+          <strong>Illegear Support Team</strong>
+        </p>
       </div>
+
+      <!-- Footer -->
+      <div style="background:#f0f0f0;padding:14px 32px;text-align:center;
+                  border-top:1px solid #e0e0e0;">
+        <p style="margin:0;font-size:11px;color:#999999;">
+          {FROM_EMAIL} &nbsp;|&nbsp; This is an automated message, please do not reply directly.
+        </p>
+      </div>
+
     </div>"""
+
     msg.attach(MIMEText(body, "plain"))
     msg.attach(MIMEText(html, "html"))
 
