@@ -282,6 +282,7 @@ def send_email(smtp_pass, to_email, customer_name, ticket_number, device, templa
         <p style="font-size:15px;line-height:1.6;">
           Good news! Your device has been repaired and is now
           <strong style="color:#cc0000;">ready for collection</strong>.
+          If you already collect the Device, we are sorry for your inconvenience.
         </p>
 
         <!-- Ticket Info Box -->
