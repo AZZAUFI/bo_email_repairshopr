@@ -219,15 +219,35 @@ def api_get(api_key, path, params=None):
         return None, str(e)
 
 
-def fetch_ready_tickets(api_key, status_filter):
-    data, err = api_get(
-        api_key,
-        "tickets",
-        {"status": status_filter, "per_page": 100, "page": 1},
-    )
+def fetch_ready_tickets(api_key, status_filter, date_from=None, date_to=None):
+    """Return tickets matching status. Optionally filter by updated_at date range."""
+    params = {"status": status_filter, "per_page": 100, "page": 1}
+    # RepairShopr supports since/until as ISO date strings
+    if date_from:
+        params["since"] = date_from.strftime("%Y-%m-%d")
+    if date_to:
+        params["until"] = date_to.strftime("%Y-%m-%d")
+    data, err = api_get(api_key, "tickets", params)
     if err:
         return [], err
-    return data.get("tickets", []), None
+    tickets = data.get("tickets", [])
+    # Client-side guard: also filter updated_at locally in case API ignores the params
+    if date_from or date_to:
+        filtered = []
+        for t in tickets:
+            upd_str = (t.get("updated_at") or "")[:10]
+            try:
+                upd = date.fromisoformat(upd_str)
+            except ValueError:
+                filtered.append(t)
+                continue
+            if date_from and upd < date_from:
+                continue
+            if date_to and upd > date_to:
+                continue
+            filtered.append(t)
+        return filtered, None
+    return tickets, None
 
 
 # ── Email ──────────────────────────────────────────────────────────────────────
@@ -388,9 +408,9 @@ def _extract_contact(ticket: dict) -> tuple[str, str]:
 
 
 # ── Core poll function (no threads) ───────────────────────────────────────────
-def run_poll(api_key, smtp_pass, status_filter, template):
+def run_poll(api_key, smtp_pass, status_filter, template, date_from=None, date_to=None):
     """One full scan: fetch tickets → send emails → log results."""
-    tickets, err = fetch_ready_tickets(api_key, status_filter)
+    tickets, err = fetch_ready_tickets(api_key, status_filter, date_from, date_to)
 
     if err:
         add_log("ERROR", f"API error: {err}")
@@ -447,6 +467,7 @@ _ss("status_filter", "Device is Ready for Collection")
 _ss("filter_mode", "Latest Status (Live)")
 _ss("date_from", date.today() - timedelta(days=7))
 _ss("date_to", date.today())
+_ss("use_date_filter", False)
 _ss("last_poll", 0.0)
 _ss(
     "email_template",
@@ -498,6 +519,25 @@ with st.sidebar:
     )
 
     st.markdown("---")
+    st.markdown("### 📅 Date Range Filter")
+    st.session_state.use_date_filter = st.toggle(
+        "Filter by ticket updated date", value=st.session_state.use_date_filter
+    )
+    if st.session_state.use_date_filter:
+        st.session_state.date_from = st.date_input(
+            "From", value=st.session_state.date_from, key="df_from"
+        )
+        st.session_state.date_to = st.date_input(
+            "To", value=st.session_state.date_to, key="df_to"
+        )
+        if st.session_state.date_from > st.session_state.date_to:
+            st.error("'From' must be before 'To'.")
+        else:
+            st.caption(
+                f"Only tickets updated {st.session_state.date_from} → {st.session_state.date_to} will trigger emails."
+            )
+
+    st.markdown("---")
     c1, c2 = st.columns(2)
     with c1:
         if st.button("▶ Start", disabled=st.session_state.bot_on):
@@ -525,11 +565,15 @@ seconds_until_next = max(0, POLL_INTERVAL - seconds_since_last)
 if st.session_state.bot_on:
     if seconds_since_last >= POLL_INTERVAL:
         with st.spinner("🔍 Checking RepairShopr..."):
+            _df = st.session_state.date_from if st.session_state.use_date_filter else None
+            _dt = st.session_state.date_to   if st.session_state.use_date_filter else None
             run_poll(
                 st.session_state.api_key,
                 st.session_state.smtp_pass,
                 st.session_state.status_filter,
                 st.session_state.email_template,
+                date_from=_df,
+                date_to=_dt,
             )
         st.session_state.last_poll = time.time()
         seconds_until_next = POLL_INTERVAL
@@ -646,6 +690,17 @@ with tab2:
                 "Notified At",
             ],
         )
+        # ── Date range filter for notified list ──
+        t2c1, t2c2 = st.columns(2)
+        with t2c1:
+            t2_from = st.date_input("Notified from", value=date.today() - timedelta(days=30), key="t2_from")
+        with t2c2:
+            t2_to = st.date_input("Notified to", value=date.today(), key="t2_to")
+        t2_use = st.checkbox("Filter by notified date", value=False, key="t2_use")
+        if t2_use:
+            mask = pd.to_datetime(df["Notified At"], errors="coerce").dt.date
+            df = df[(mask >= t2_from) & (mask <= t2_to)]
+            st.caption(f"Showing {len(df)} record(s) between {t2_from} → {t2_to}")
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 # ── Tab 3: Manual Ticket Check ─────────────────────────────────────────────────
@@ -664,21 +719,51 @@ with tab3:
         key="ms",
     )
 
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        manual_date_from = st.date_input(
+            "Updated from", value=date.today() - timedelta(days=7), key="mc_from"
+        )
+    with mc2:
+        manual_date_to = st.date_input(
+            "Updated to", value=date.today(), key="mc_to"
+        )
+    manual_use_dates = st.checkbox("Apply date range filter", value=False, key="mc_use_dates")
+
     if st.button("🔍 Fetch Tickets Now"):
         if not st.session_state.api_key:
             st.error("Enter API key in sidebar first.")
+        elif manual_use_dates and manual_date_from > manual_date_to:
+            st.error("'From' date must be before 'To' date.")
         else:
             with st.spinner("Fetching..."):
                 s = "" if manual_status == "— Show All —" else manual_status
-                data, err = api_get(
-                    st.session_state.api_key,
-                    "tickets",
-                    {"status": s, "per_page": 100, "page": 1},
-                )
+                _mdf = manual_date_from if manual_use_dates else None
+                _mdt = manual_date_to   if manual_use_dates else None
+                tickets, err = fetch_ready_tickets(
+                    st.session_state.api_key, s, _mdf, _mdt
+                ) if s else ([], None)
+                # for "Show All" we still need to call api_get directly
+                if not s:
+                    data, err = api_get(
+                        st.session_state.api_key,
+                        "tickets",
+                        {"per_page": 100, "page": 1},
+                    )
+                    tickets = data.get("tickets", []) if data else []
+                    # apply client-side date filter for "Show All"
+                    if manual_use_dates and tickets:
+                        def _in_range(t):
+                            upd_str = (t.get("updated_at") or "")[:10]
+                            try:
+                                upd = date.fromisoformat(upd_str)
+                                return _mdf <= upd <= _mdt
+                            except ValueError:
+                                return True
+                        tickets = [t for t in tickets if _in_range(t)]
             if err:
                 st.error(f"API error: {err}")
-            elif data:
-                tickets = data.get("tickets", [])
+            elif tickets is not None:
                 if tickets:
                     with st.expander("🔬 Full JSON of the first ticket"):
                         st.json(tickets[0])
@@ -791,11 +876,15 @@ with tab4:
             st.error("Fill in API key and password first.")
         else:
             with st.spinner("Polling…"):
+                _df = st.session_state.date_from if st.session_state.use_date_filter else None
+                _dt = st.session_state.date_to   if st.session_state.use_date_filter else None
                 run_poll(
                     st.session_state.api_key,
                     st.session_state.smtp_pass,
                     st.session_state.status_filter,
                     st.session_state.email_template,
+                    date_from=_df,
+                    date_to=_dt,
                 )
             st.session_state.last_poll = time.time()
             st.success("Poll complete — check Live Logs tab.")
