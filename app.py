@@ -8,12 +8,13 @@ NO background threads — polling is driven by Streamlit's own rerun loop.
 This guarantees exactly ONE API call per cycle, no duplicate threads, no 429 floods.
 """
 
+import re
 import streamlit as st
 import requests
 import smtplib
 import sqlite3
 import time
-import json                         # ← added
+import json
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
@@ -24,7 +25,25 @@ SUBDOMAIN     = "illegearticket"
 FROM_EMAIL    = "support@illegear.com"
 SMTP_HOST     = "mail.illegear.com"
 SMTP_PORT     = 587
-POLL_INTERVAL = 120   # seconds between API polls (2 min – safely under 180 req/min)
+POLL_INTERVAL = 120   # seconds between API polls (2 min – safely under 180 req/min)
+
+# ── Email validation ───────────────────────────────────────────────────────────
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# All internal/staff addresses that must NEVER receive customer notifications
+EXCLUDED_EMAILS = {
+    FROM_EMAIL.lower(),
+    "support@illegear.com",
+}
+
+def _is_valid_customer_email(email: str) -> bool:
+    """Return True only if the address is a well-formed, non-internal email."""
+    if not email:
+        return False
+    e = email.strip().lower()
+    if e in EXCLUDED_EMAILS:
+        return False
+    return bool(_EMAIL_RE.match(e))
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -76,7 +95,7 @@ section[data-testid="stSidebar"]{background-color:var(--surface)!important;borde
 # ── Database (singleton) ───────────────────────────────────────────────────────
 if hasattr(st, "cache_resource"):
     _cache_res = st.cache_resource
-else:                         # fallback for very old Streamlit releases
+else:
     _cache_res = st.experimental_singleton
 
 
@@ -84,7 +103,7 @@ else:                         # fallback for very old Streamlit releases
 def get_db():
     """Create (or reuse) a single SQLite connection for the app lifetime."""
     conn = sqlite3.connect("notifier.db", check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")  # safe for concurrent reads
+    conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS notified (
             ticket_id TEXT PRIMARY KEY,
@@ -105,7 +124,6 @@ def get_db():
             message TEXT
         )"""
     )
-    # Back‑compatibility: add missing columns if an older DB is detected
     cols = [r[1] for r in conn.execute("PRAGMA table_info(notified)").fetchall()]
     for col in ["device", "status", "updated_at"]:
         if col not in cols:
@@ -116,9 +134,8 @@ def get_db():
 
 DB = get_db()
 
-# ----- DB helper wrappers -------------------------------------------------
+# ── DB helper wrappers ─────────────────────────────────────────────────────────
 def already_notified(ticket_id: str) -> bool:
-    """True if this ticket has already been processed."""
     return (
         DB.execute("SELECT 1 FROM notified WHERE ticket_id=?", (ticket_id,)).fetchone()
         is not None
@@ -126,7 +143,6 @@ def already_notified(ticket_id: str) -> bool:
 
 
 def mark_notified(ticket_id, name, email, number, device, status, updated_at):
-    """Insert a row indicating we have sent a notification for this ticket."""
     DB.execute(
         """INSERT OR IGNORE INTO notified (
             ticket_id, customer_name, customer_email, ticket_number,
@@ -147,11 +163,15 @@ def mark_notified(ticket_id, name, email, number, device, status, updated_at):
 
 
 def add_log(level, message):
-    DB.execute(
-        "INSERT INTO logs (ts, level, message) VALUES (?,?,?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, message),
-    )
-    DB.commit()
+    """Write a log entry — always coerces to str so SQLite never rejects it."""
+    try:
+        DB.execute(
+            "INSERT INTO logs (ts, level, message) VALUES (?,?,?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(level), str(message)),
+        )
+        DB.commit()
+    except Exception as log_err:
+        print(f"[add_log failed] {log_err} | original: {level} {message}")
 
 
 def get_logs(limit=100):
@@ -185,14 +205,12 @@ def prune_logs():
 
 # ── API ────────────────────────────────────────────────────────────────────────
 def api_get(api_key, path, params=None):
-    """Single safe API call; respects 429 responses."""
     url = f"https://{SUBDOMAIN}.repairshopr.com/api/v1/{path}"
     headers = {"Authorization": f"Bearer {api_key}"}
     try:
         resp = requests.get(url, headers=headers, params=params or {}, timeout=15)
         if resp.status_code == 429:
             wait = int(resp.headers.get("Retry-After", 60))
-            # Back‑off the next poll
             st.session_state.last_poll = time.time() + wait
             return None, f"429 – rate limited, retry after {wait}s"
         resp.raise_for_status()
@@ -202,7 +220,6 @@ def api_get(api_key, path, params=None):
 
 
 def fetch_ready_tickets(api_key, status_filter):
-    """Return tickets that match the configured status (page 1 only)."""
     data, err = api_get(
         api_key,
         "tickets",
@@ -290,15 +307,14 @@ def send_email(smtp_pass, to_email, customer_name, ticket_number, device, templa
         return False, str(e)
 
 
-# ── Helper: robust extraction of name & e‑mail ─────────────────────────────────────
+# ── Helper: robust extraction of name & e‑mail ────────────────────────────────
 def _extract_contact(ticket: dict) -> tuple[str, str]:
     """
-    Try every known place where RepairShopr stores a contact name / e‑mail.
-    Returns (name, email).  ``email`` may be empty → the bot will skip that ticket.
+    Try every known place where RepairShopr stores a contact name / e-mail.
+    Returns (name, email). email may be empty → the bot will skip that ticket.
+    Internal/staff addresses are always rejected.
     """
-    # -----------------------------------------------------------------
     # 1️⃣ Customer object (most common)
-    # -----------------------------------------------------------------
     cust = ticket.get("customer") or {}
     name = (
         cust.get("fullname")
@@ -306,65 +322,61 @@ def _extract_contact(ticket: dict) -> tuple[str, str]:
         or f"{cust.get('firstname','')} {cust.get('lastname','')}".strip()
     )
     email = cust.get("email")
+    if email and not _is_valid_customer_email(email):
+        email = None  # reject internal address, keep looking
 
-    # -----------------------------------------------------------------
-    # 2️⃣ Contact object (when there is no linked Customer)
-    # -----------------------------------------------------------------
+    # 2️⃣ Contact object
     if not email:
         contact = ticket.get("contact") or {}
-        email = contact.get("email")
+        candidate = contact.get("email")
+        if candidate and _is_valid_customer_email(candidate):
+            email = candidate
         if not name:
             name = f"{contact.get('firstname','')} {contact.get('lastname','')}".strip()
 
-    # -----------------------------------------------------------------
-    # 3️⃣ Legacy “requester” field
-    # -----------------------------------------------------------------
+    # 3️⃣ Legacy "requester" field
     if not email:
         requester = ticket.get("requester") or {}
-        email = requester.get("email")
+        candidate = requester.get("email")
+        if candidate and _is_valid_customer_email(candidate):
+            email = candidate
         if not name:
             name = requester.get("name")
 
-    # -----------------------------------------------------------------
-    # 4️⃣ Root‑level shortcuts
-    # -----------------------------------------------------------------
+    # 4️⃣ Root-level shortcuts
     if not email:
-        email = ticket.get("email") or ticket.get("contact_email")
+        for key in ("email", "contact_email"):
+            candidate = ticket.get(key)
+            if candidate and _is_valid_customer_email(candidate):
+                email = candidate
+                break
     if not name:
         name = ticket.get("name") or ticket.get("customer_name")
 
-    # -----------------------------------------------------------------
-    # 5️⃣ **COMMENTS → destination_emails** (the field you posted)
-    # -----------------------------------------------------------------
+    # 5️⃣ Comments → destination_emails
     if not email:
         comments = ticket.get("comments", [])
         if comments:
-            first = comments[0]                     # dict
-            dest = first.get("destination_emails")  # e.g. "john@example.com, bob@…"
-            if dest:
-                possible = [e.strip() for e in dest.split(",") if e.strip()]
-                if possible:
-                    email = possible[0]
+            dest = comments[0].get("destination_emails", "")
+            for candidate in [e.strip() for e in dest.split(",") if e.strip()]:
+                if _is_valid_customer_email(candidate):
+                    email = candidate
+                    break
 
-    # -----------------------------------------------------------------
-    # 6️⃣ Custom fields (if you store e‑mail there)
-    # -----------------------------------------------------------------
+    # 6️⃣ Custom fields
     if not email:
         cf = ticket.get("custom_fields", {})
-        email = cf.get("client_email") or cf.get("<YOUR_EMAIL_FIELD_ID>")
+        for key in ("client_email",):
+            candidate = cf.get(key)
+            if candidate and _is_valid_customer_email(candidate):
+                email = candidate
+                break
 
-    # -----------------------------------------------------------------
-    # 7️⃣ Optional fallback to the staff user that created the ticket
-    # -----------------------------------------------------------------
-    # (Usually you **don’t** want to send to this address, but the code is kept
-    # here in case you ever need it.)
-    if not email:
-        user = ticket.get("user") or {}
-        email = user.get("email")
+    # 7️⃣ Staff user fallback — BLOCKED intentionally to prevent sending to
+    #    internal addresses or ex-staff Gmail accounts that no longer exist.
+    #    Do NOT re-enable without an explicit allow-list check.
 
-    # -----------------------------------------------------------------
-    # 8️⃣ Normalise & log what was finally used
-    # -----------------------------------------------------------------
+    # 8️⃣ Normalise
     name = (name or "").strip() or "Customer"
     email = (email or "").strip()
 
@@ -375,7 +387,7 @@ def _extract_contact(ticket: dict) -> tuple[str, str]:
     return name, email
 
 
-# ── Core poll function (no threads) ─────────────────────────────────────────────
+# ── Core poll function (no threads) ───────────────────────────────────────────
 def run_poll(api_key, smtp_pass, status_filter, template):
     """One full scan: fetch tickets → send emails → log results."""
     tickets, err = fetch_ready_tickets(api_key, status_filter)
@@ -388,7 +400,6 @@ def run_poll(api_key, smtp_pass, status_filter, template):
     for idx, t in enumerate(tickets):
         tid = str(t.get("id"))
 
-        # DEBUG: keep a tiny snippet of the raw ticket for the first two tickets
         if idx < 2:
             add_log(
                 "DEBUG",
@@ -400,11 +411,12 @@ def run_poll(api_key, smtp_pass, status_filter, template):
         status = t.get("status", "")
         upd = (t.get("updated_at") or "")[:19]
 
-        # ---- Use the robust extractor ---------------------------------
         name, email = _extract_contact(t)
 
-        # Skip if we already processed it or if there is **no** e‑mail address
-        if not email or already_notified(tid):
+        # Skip: no email, invalid/internal email, or already notified
+        if not email or not _is_valid_customer_email(email) or already_notified(tid):
+            if email and not _is_valid_customer_email(email):
+                add_log("WARN", f"Skipped ticket #{number} — invalid/internal email: '{email}'")
             continue
 
         ok, err2 = send_email(smtp_pass, email, name, number, device, template)
@@ -413,7 +425,7 @@ def run_poll(api_key, smtp_pass, status_filter, template):
             add_log("OK", f"Notified {name} ({email}) — Ticket #{number}")
             new_count += 1
         else:
-            add_log("ERROR", f"Email failed for {name} ({email}): {err2}")
+            add_log("ERROR", f"Email failed for {name} ({email}): {str(err2)}")
 
     add_log(
         "INFO",
@@ -422,7 +434,7 @@ def run_poll(api_key, smtp_pass, status_filter, template):
     prune_logs()
 
 
-# ── Session‑state helpers ─────────────────────────────────────────────────────
+# ── Session‑state helpers ──────────────────────────────────────────────────────
 def _ss(key, default):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -435,13 +447,13 @@ _ss("status_filter", "Device is Ready for Collection")
 _ss("filter_mode", "Latest Status (Live)")
 _ss("date_from", date.today() - timedelta(days=7))
 _ss("date_to", date.today())
-_ss("last_poll", 0.0)  # unix timestamp of last poll
+_ss("last_poll", 0.0)
 _ss(
     "email_template",
     "Hi {name},\n\nYour device ({device}) is ready for collection.\nTicket: #{ticket}\n\nThank you!\nIllegear Support Team",
 )
 
-# ── Sidebar UI ───────────────────────────────────────────────────────────────────
+# ── Sidebar UI ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
     st.markdown("---")
@@ -493,7 +505,7 @@ with st.sidebar:
                 st.error("Fill API key & password first.")
             else:
                 st.session_state.bot_on = True
-                st.session_state.last_poll = 0.0  # poll immediately on next rerun
+                st.session_state.last_poll = 0.0
                 add_log(
                     "INFO",
                     f"Bot enabled | status='{st.session_state.status_filter}' | interval={POLL_INTERVAL}s",
@@ -505,14 +517,13 @@ with st.sidebar:
             add_log("INFO", "Bot disabled by user")
             st.rerun()
 
-# ── Poll timer logic (main thread) ───────────────────────────────────────────────
+# ── Poll timer logic ───────────────────────────────────────────────────────────
 now = time.time()
 seconds_since_last = now - st.session_state.last_poll
 seconds_until_next = max(0, POLL_INTERVAL - seconds_since_last)
 
 if st.session_state.bot_on:
     if seconds_since_last >= POLL_INTERVAL:
-        # Time for a fresh scan
         with st.spinner("🔍 Checking RepairShopr..."):
             run_poll(
                 st.session_state.api_key,
@@ -523,7 +534,7 @@ if st.session_state.bot_on:
         st.session_state.last_poll = time.time()
         seconds_until_next = POLL_INTERVAL
 
-# ── Header UI ─────────────────────────────────────────────────────────────────────
+# ── Header UI ─────────────────────────────────────────────────────────────────
 status_html = (
     '<span class="bot-status bot-on"><span class="pulse"></span>BOT RUNNING</span>'
     if st.session_state.bot_on
@@ -548,7 +559,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Metrics cards ───────────────────────────────────────────────────────────────
+# ── Metrics cards ──────────────────────────────────────────────────────────────
 notified_list = get_notified_list()
 logs = get_logs(200)
 errors = [l for l in logs if l[1] == "ERROR"]
@@ -593,7 +604,7 @@ tab1, tab2, tab3, tab4 = st.tabs(
     ["📋 Live Logs", "✅ Notified Customers", "🔍 Manual Check", "🧪 Diagnostics"]
 )
 
-# ── Tab 1: Live Logs ───────────────────────────────────────────────────────
+# ── Tab 1: Live Logs ───────────────────────────────────────────────────────────
 with tab1:
     ca, cb = st.columns([3, 1])
     with ca:
@@ -617,7 +628,7 @@ with tab1:
                 unsafe_allow_html=True,
             )
 
-# ── Tab 2: Notified Customers ─────────────────────────────────────────────────────
+# ── Tab 2: Notified Customers ──────────────────────────────────────────────────
 with tab2:
     st.markdown("#### Customers Successfully Notified")
     if not notified_list:
@@ -637,7 +648,7 @@ with tab2:
         )
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-# ── Tab 3: Manual Ticket Check ─────────────────────────────────────────────────
+# ── Tab 3: Manual Ticket Check ─────────────────────────────────────────────────
 with tab3:
     st.markdown("#### Manual Ticket Check")
     manual_status = st.selectbox(
@@ -669,7 +680,6 @@ with tab3:
             elif data:
                 tickets = data.get("tickets", [])
                 if tickets:
-                    # ---- NEW: show raw JSON of the first ticket ----
                     with st.expander("🔬 Full JSON of the first ticket"):
                         st.json(tickets[0])
 
@@ -680,7 +690,6 @@ with tab3:
                         status = t.get("status", "—")
                         updated = (t.get("updated_at") or "")[:10]
 
-                        # Use the robust extractor for name & e‑mail
                         name, email = _extract_contact(t)
 
                         rows.append(
@@ -714,12 +723,11 @@ with tab3:
                 else:
                     st.warning("No tickets found with that status.")
 
-# ── Tab 4: Diagnostics ────────────────────────────────────────────────────────
+# ── Tab 4: Diagnostics ────────────────────────────────────────────────────────
 with tab4:
     st.markdown("#### 🧪 Connection Diagnostics")
     st.markdown("---")
 
-    # ---- 1️⃣ Test API key -------------------------------------------------
     st.markdown("##### 1️⃣ Test API Key")
     if st.button("🔑 Test API Connection"):
         if not st.session_state.api_key:
@@ -750,7 +758,6 @@ with tab4:
 
     st.markdown("---")
 
-    # ---- 2️⃣ Test SMTP ----------------------------------------------------
     st.markdown("##### 2️⃣ Test Email (SMTP)")
     test_to = st.text_input("Send test to", placeholder="youremail@example.com")
     if st.button("📧 Send Test Email"):
@@ -773,11 +780,10 @@ with tab4:
                 add_log("OK", f"SMTP test sent to {test_to}")
             else:
                 st.error(f"❌ Failed: {err}")
-                add_log("ERROR", f"SMTP test failed: {err}")
+                add_log("ERROR", f"SMTP test failed: {str(err)}")
 
     st.markdown("---")
 
-    # ---- 3️⃣ Run one poll --------------------------------------------------
     st.markdown("##### 3️⃣ Run One Poll Now")
     st.caption("Manually trigger one scan without waiting for the timer.")
     if st.button("▶ Run Poll Now"):
@@ -795,9 +801,8 @@ with tab4:
             st.success("Poll complete — check Live Logs tab.")
             st.rerun()
 
-# ── Auto‑refresh while bot is running (no blocking sleep) ───────────────────────
+# ── Auto‑refresh while bot is running ─────────────────────────────────────────
 if st.session_state.bot_on:
-    # Light‑weight wait – refreshes UI every 10 s while the bot is active
     time.sleep(10)
     if hasattr(st, "rerun"):
         st.rerun()
