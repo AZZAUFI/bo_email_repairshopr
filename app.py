@@ -304,9 +304,9 @@ def send_email(smtp_pass, to_email, customer_name, ticket_number, device, templa
           Good news! Your device has been repaired and is now
           <strong style="color:#cc0000;">ready for collection</strong>.
         </p>
-        <p style="font-size:15px;">Hi <strong>{customer_name}</strong>,</p>
-        <p style="font-size:15px;line-height:1.6;">
-          Please ignore this email if your device already collected. 
+        <p style="font-size:14px;color:#444444;line-height:1.6;">
+          Please bring this ticket number when collecting your device from our service centre.
+          If you have any questions, feel free to reply to this email.
         </p>
 
         <!-- Ticket Info Box -->
@@ -346,8 +346,7 @@ def send_email(smtp_pass, to_email, customer_name, ticket_number, device, templa
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
             s.starttls()
             s.login(FROM_EMAIL, smtp_pass)
-            # Envelope sender = noreply so any bounce goes there, not support inbox
-            s.sendmail(NOREPLY_EMAIL, to_email, msg.as_string())
+            s.sendmail(FROM_EMAIL, to_email, msg.as_string())
         return True, None
     except Exception as e:
         return False, str(e)
