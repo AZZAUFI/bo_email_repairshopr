@@ -305,8 +305,7 @@ def send_email(smtp_pass, to_email, customer_name, ticket_number, device, templa
           <strong style="color:#cc0000;">ready for collection</strong>.
         </p>
         <p style="font-size:14px;color:#444444;line-height:1.6;">
-          Please bring this ticket number when collecting your device from our service centre.
-          If you have any questions, feel free to reply to this email.
+          Please ignore this email if your device already collected. 
         </p>
 
         <!-- Ticket Info Box -->
